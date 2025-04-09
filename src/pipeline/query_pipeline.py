@@ -23,6 +23,7 @@ from langchain_core.documents import Document
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # Configure logging
 logging.basicConfig(
@@ -118,33 +119,38 @@ class QueryPipeline:
             logger.info(f"Initialized LLM: {llm_model_name}")
 
             # Define prompt template
-            # (Using the template similar to the one in GeminiInterface example)
             self.compliance_prompt = PromptTemplate(
                 input_variables=["context", "document"],
-                template="""You are an expert AI assistant specialized in RBI regulations and banking compliance. 
-                You will be given excerpts from RBI regulatory documents and a section of a bank's internal policy. 
-                Your job is to assess whether the policy section complies with the regulations, point out any compliance issues, 
-                and cite the relevant RBI rules.
+                template="""You are an expert AI assistant specialized in RBI regulations and banking compliance.
+                You will be given excerpts from RBI regulatory documents ('Context') and a section of a bank's internal policy ('Bank's Policy Section').
+                Your task is to assess whether the Bank's Policy Section complies with the provided RBI Regulations context.
 
-                When you refer to an RBI regulation, include the document reference or clause number from the provided context.
-                If a relevant regulation is not provided in context, say you are not certain, rather than guessing.
-                Base your analysis ONLY on the provided context and document section.
-                
-                Context:
+                **Instructions:**
+                1.  Carefully analyze the Bank's Policy Section against EACH relevant point in the RBI Regulations context.
+                2.  Base your analysis STRICTLY on the provided text. Do NOT assume prior knowledge or regulations not present in the Context.
+                3.  Identify any specific areas of non-compliance, potential compliance issues, or confirm compliance.
+                4.  For each point of analysis (compliance confirmed, issue identified), CLEARLY CITE the relevant regulation from the Context using the provided source identifier (e.g., [Source: Doc 1], [Source: Doc 2, Clause 5]).
+                5.  If the provided Context does not contain information to assess a specific part of the policy, explicitly state that you cannot determine compliance for that part based on the given context.
+                6.  Structure your response EXACTLY as follows:
+
+                **1. Summary:** A brief one-sentence overview (e.g., Compliant, Non-Compliant, Potential Issues Found).
+                **2. Compliance Issues:** List each identified issue OR state 'No compliance issues identified based on the provided context.'
+                   - Issue 1: [Description of issue] (Relevant Regulation: [Citation from Context]).
+                   - Issue 2: [Description of issue] (Relevant Regulation: [Citation from Context]).
+                **3. Compliance Confirmation:** List areas where the policy IS compliant with the context OR state 'No specific compliant areas noted' if focusing only on issues.
+                   - Point 1: [Description of compliant aspect] (Relevant Regulation: [Citation from Context]).
+                **4. Areas of Uncertainty:** List parts of the policy that cannot be assessed due to lack of relevant information in the Context OR state 'All parts of the policy section could be assessed against the provided context.'
+                   - Uncertainty 1: [Description of policy part] (Reason: No relevant regulation provided in context).
+                **5. Recommendations:** (Optional) Suggest specific changes ONLY if non-compliance was found.
+
+                **Context:**
                 RBI Regulations:
                 {context}
-                
-                Bank's Policy Section:
+
+                **Bank's Policy Section:**
                 {document}
-                
-                Analysis:
-                Identify any compliance issues in the bank's policy section with respect to RBI regulations. 
-                Cite the relevant RBI guidelines in your answer. If no issues are found, confirm compliance and cite the relevant guidelines.
-                
-                Format your response as follows:
-                1. Summary: A brief overview of your compliance assessment (Compliant / Non-Compliant / Potential Issues).
-                2. Issues: List each compliance issue with citation (if any). If none, state "No issues found".
-                3. Recommendations: Suggested changes to ensure compliance (if applicable).
+
+                **Analysis:**
                 """
             )
             
@@ -161,53 +167,56 @@ class QueryPipeline:
         logger.info("Initialized document processor.")
 
     def _process_user_document(self, document_path: str) -> List[str]:
-        """Process the user's document into text chunks.
-        For now, treats the whole document as one chunk after text extraction.
-        """
+        """Process the user's document into text chunks using RecursiveCharacterTextSplitter."""
         logger.info(f"Processing user document: {document_path}")
         file_ext = Path(document_path).suffix.lower()
-        chunks = []
+        full_text = ""
 
-        if file_ext == ".pdf":
-            # Use PDFProcessor logic (assuming it returns text per page or similar)
-            pdf_chunks = self.doc_processor.pdf_processor.process_document(document_path)
-            # Consolidate PDF chunks into logical sections if possible, or just join text
-            # Simple approach: join all text for now
-            full_text = " ".join([chunk['text'] for chunk in pdf_chunks])
-            chunks.append(full_text)
-        elif file_ext == ".html" or file_ext == ".htm":
-            html_chunks = self.doc_processor.html_processor.process_document(document_path)
-            full_text = " ".join([chunk['text'] for chunk in html_chunks])
-            chunks.append(full_text)
-        elif file_ext == ".txt":
-            with open(document_path, "r", encoding="utf-8") as f:
-                chunks.append(f.read())
-        elif file_ext == ".docx":
-            try:
-                import docx
-                doc = docx.Document(document_path)
-                full_text = "\n".join([para.text for para in doc.paragraphs])
-                chunks.append(full_text)
-            except ImportError:
-                logger.error("python-docx library not found. Install it (`pip install python-docx`) to process .docx files.")
-                raise
-            except Exception as e:
-                logger.error(f"Error processing DOCX file {document_path}: {e}")
-                raise
-        else:
-            logger.error(f"Unsupported document format: {file_ext}")
-            raise ValueError(f"Unsupported document format: {file_ext}")
+        try:
+            if file_ext == ".pdf":
+                pdf_chunks = self.doc_processor.pdf_processor.process_document(document_path)
+                full_text = "\n\n".join([chunk['text'] for chunk in pdf_chunks]) # Join pages/chunks first
+            elif file_ext == ".html" or file_ext == ".htm":
+                html_chunks = self.doc_processor.html_processor.process_document(document_path)
+                full_text = " ".join([chunk['text'] for chunk in html_chunks])
+            elif file_ext == ".txt":
+                with open(document_path, "r", encoding="utf-8") as f:
+                    full_text = f.read()
+            elif file_ext == ".docx":
+                try:
+                    import docx
+                    doc = docx.Document(document_path)
+                    full_text = "\n".join([para.text for para in doc.paragraphs])
+                except ImportError:
+                    logger.error("python-docx library not found. Install it (`pip install python-docx`) to process .docx files.")
+                    raise
+                except Exception as e:
+                    logger.error(f"Error processing DOCX file {document_path}: {e}")
+                    raise
+            else:
+                logger.error(f"Unsupported document format: {file_ext}")
+                raise ValueError(f"Unsupported document format: {file_ext}")
 
-        # Basic chunking (e.g., by paragraphs or fixed size) can be added here if needed
-        # For now, return the full text as a single chunk
-        # Placeholder: simple paragraph splitting
-        final_chunks = []
-        for text in chunks:
-            paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()] # Split by double newline
-            final_chunks.extend(paragraphs)
+            if not full_text.strip():
+                logger.warning(f"Document {document_path} appears to be empty after text extraction.")
+                return []
+
+            # Use RecursiveCharacterTextSplitter for chunking
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,  # Target size for chunks
+                chunk_overlap=200, # Overlap between chunks
+                length_function=len,
+                is_separator_regex=False,
+                separators=["\n\n", "\n", ". ", " ", ""] # Common separators
+            )
             
-        logger.info(f"Processed document into {len(final_chunks)} chunks.")
-        return final_chunks if final_chunks else chunks # Return paragraphs if split, else original
+            final_chunks = text_splitter.split_text(full_text)
+            logger.info(f"Processed document into {len(final_chunks)} chunks using RecursiveCharacterTextSplitter.")
+            return final_chunks
+
+        except Exception as e:
+             logger.error(f"Failed to process document {document_path}: {e}")
+             return [] # Return empty list on error
 
     def retrieve_relevant_regulations(self, query: str, top_k: int = 5, score_threshold: Optional[float] = None) -> List[Dict]:
         """Retrieve relevant regulations from Qdrant.
