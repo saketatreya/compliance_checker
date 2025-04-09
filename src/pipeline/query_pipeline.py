@@ -44,7 +44,7 @@ class QueryPipeline:
         qdrant_port: int = 6333,
         qdrant_collection: str = "rbi_regulations",
         embedding_model_name: str = "msmarco-distilbert-base-tas-b",
-        llm_model_name: str = "gemini-pro",
+        llm_model_name: str = "models/gemini-1.5-flash",
         google_api_key: Optional[str] = None,
     ):
         """Initialize the query pipeline.
