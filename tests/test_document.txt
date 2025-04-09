@@ -1,0 +1,39 @@
+# Sample RBI Regulatory Excerpts Document (Mimicking Style)
+
+## Section 1: Exposure Norms and Limits
+
+1.1 **Single Borrower Limit:** The total exposure (both fund-based and non-fund-based) of a bank to a single borrower shall not exceed 15% of the bank's Tier 1 capital. However, in exceptional circumstances, the bank's Board may approve an additional 5%, subject to proper risk assessment.
+
+1.2 **Group Borrower Limit:** The total exposure of a bank to a group of connected borrowers or parties shall not exceed 25% of the bank's Tier 1 capital. The definition of 'connected borrowers' must align with RBI Master Circular Ref: UBD.BPD.(PCB).MC.No.1/13.05.000/2025-26.
+
+1.3 **Capital Funds Definition:** For the purpose of calculating exposure limits, 'Tier 1 Capital' shall be computed as per the latest RBI guidelines on Capital Adequacy (Ref: DOR.CAP.REC.XX/21.06.201/2025-26). Any erosion in capital must be immediately accounted for when assessing limits.
+
+## Section 2: Unsecured Advances
+
+2.1 **General Limit:** The aggregate ceiling on unsecured advances (those without tangible security or guarantees) shall not exceed 10% of the bank's total assets as per the audited balance-sheet as on 31 March of the preceding financial year.
+
+2.2 **Individual Unsecured Limit:** Unsecured loans granted to individual borrowers, excluding salary earners' loans with appropriate deductions, shall generally not exceed ₹5.00 lakh per borrower. (Note: This specific limit applies to UCBs with deposits above ₹100 Crore and CRAR >= 9%. For others, lower limits apply as per RBI guidelines, see Clause 4.1).
+
+2.3 **SHG/JLG Exemption:** Unsecured loan limits mentioned in 2.1 and 2.2 *do not apply* to loans granted to Self-Help Groups (SHGs). For Joint Liability Groups (JLGs), the unsecured portion is subject to individual limits. (See Section 4).
+
+## Section 3: Loans to Directors and Relatives
+
+3.1 **Prohibition:** Banks are strictly prohibited from granting any loans or advances, whether secured or unsecured, to their directors or their relatives (as defined in the Companies Act and Banking Regulation Act).
+
+3.2 **Disclosure:** Any existing loans to individuals who subsequently become directors must be disclosed to the Board and RBI. No renewal or enhancement of such facilities is permitted.
+
+3.3 **Firm Interest:** Loans to firms/companies where a director or their relative holds substantial interest (as defined by RBI) are also prohibited unless specifically exempted under guidelines (Ref: UBD.BPD.(PCB).Cir.No.14/13.05.000/05-06).
+
+## Section 4: Special Lending Areas
+
+4.1 **Agricultural Finance:** Direct finance to agricultural activities is permitted only for members. Banks must obtain 'no dues certificates' and adhere to scales of finance specified by NABARD/RBI. Nominal members are ineligible.
+
+4.2 **SHG/JLG Lending:** Banks may lend to SHGs/JLGs based on a board-approved policy. SHG loans can be up to 10 times group savings for well-managed groups. JLG loan amounts depend on assessed credit needs.
+
+4.3 **Financing NBFCs:** Bank finance to NBFCs is subject to specific conditions. Exclusions apply for calculating permissible finance (e.g., investments in subsidiaries). Rediscounting of NBFC bills is permitted only for scheduled UCBs under strict norms (Ref: UBD.No.DS.SUB.2/13.05.00/2000-01).
+
+## Section 5: Statutory Dues Compliance
+
+5.1 **Verification:** Before sanctioning/renewing credit facilities, banks must obtain a declaration from the borrower confirming no default in payment of statutory dues (like Provident Fund, ESI).
+
+5.2 **First Charge:** Banks must note that unpaid statutory dues like EPF have a first charge on the borrower's assets in case of insolvency, potentially superseding the bank's charge. Due diligence is required. (Ref: ACD.Plan.(IFS)1295/PR.36-78/9)

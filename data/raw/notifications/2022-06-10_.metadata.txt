@@ -1,0 +1,5 @@
+URL: https://www.rbi.org.in/Scripts/NotificationUser.aspx?Id=12338
+title: 
+date: June 10, 2022
+pdf_url: https://rbidocs.rbi.org.in/rdocs/notification/PDFs/EPMCA70C899195BD40508E1FC6A4D2FD078F.PDF
+pdf_path: data/raw/notifications/2022-06-10_.pdf
