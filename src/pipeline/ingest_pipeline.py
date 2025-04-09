@@ -30,7 +30,7 @@ class IngestionPipeline:
     def __init__(
         self,
         data_dir: str = "data",
-        embedding_model: str = "all-mpnet-base-v2",
+        embedding_model: str = "msmarco-distilbert-base-tas-b",
         start_year: int = 2015,
         end_year: Optional[int] = None,
         doc_types: List[str] = ["circulars", "notifications"],
@@ -189,7 +189,7 @@ def parse_args():
     parser.add_argument(
         "--embedding-model",
         type=str,
-        default="all-mpnet-base-v2",
+        default="msmarco-distilbert-base-tas-b",
         help="Name of the embedding model to use"
     )
     

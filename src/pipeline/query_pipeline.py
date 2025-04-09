@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Union, Any
 import tempfile
 import json
+from tqdm import tqdm
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -42,7 +43,7 @@ class QueryPipeline:
         qdrant_host: str = "localhost",
         qdrant_port: int = 6333,
         qdrant_collection: str = "rbi_regulations",
-        embedding_model_name: str = "all-mpnet-base-v2",
+        embedding_model_name: str = "msmarco-distilbert-base-tas-b",
         llm_model_name: str = "gemini-pro",
         google_api_key: Optional[str] = None,
     ):
@@ -60,46 +61,51 @@ class QueryPipeline:
         self.qdrant_port = qdrant_port
         self.qdrant_collection = qdrant_collection
         
-        # Initialize Qdrant client
+        # Initialize Qdrant client (used for direct search)
         self.qdrant_client = QdrantClient(host=qdrant_host, port=qdrant_port)
         logger.info(f"Connected to Qdrant at {qdrant_host}:{qdrant_port}")
 
-        # Initialize embedding function using LangChain
-        # For consistency, should use the same SentenceTransformer model used in ingestion.
-        # Langchain might not directly support SentenceTransformer for retrieval this way.
-        # Option 1: Use a compatible LangChain embedding (like Google's)
-        if google_api_key:
-             self.embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_api_key)
-             logger.info("Using GoogleGenerativeAIEmbeddings for retrieval.")
-        else:
-            # Option 2: Fallback or raise error if key is missing
-            # This requires SentenceTransformer integration with LangChain's VectorStoreRetriever
-            # which might need custom code or a different approach.
-            # For now, we'll rely on Google's embedding for retrieval if API key is present.
-             logger.warning("Google API Key not provided. Retrieval might not work as expected if embeddings in Qdrant are from a different model.")
-             # As a placeholder, let's try to use the SentenceTransformer directly for query embedding
-             # Note: This requires `sentence-transformers` to be installed
-             try:
-                 self._st_model = SentenceTransformer(embedding_model_name)
-                 self.embeddings = None # Indicate we'll embed manually
-                 logger.info(f"Using SentenceTransformer '{embedding_model_name}' directly for query embedding.")
-             except ImportError:
-                 logger.error("SentenceTransformers library not found. Install it (`pip install sentence-transformers`) or provide a Google API Key.")
-                 raise
-             except Exception as e:
-                  logger.error(f"Failed to load SentenceTransformer model '{embedding_model_name}': {e}")
-                  raise
+        # Initialize embedding model
+        self.embedding_model_name = embedding_model_name
+        self.embeddings = None
+        self._st_model = None
 
-        # Initialize Qdrant LangChain vector store
-        self.vector_store = Qdrant(
-            client=self.qdrant_client,
-            collection_name=self.qdrant_collection,
-            # embeddings=self.embeddings # Pass embeddings function if available and compatible
-            # If using manual embedding: embeddings are not needed here, but used in retriever.
-            embedding_function=self.embeddings # Try passing it, Langchain might handle it
-        )
-        logger.info(f"Initialized LangChain Qdrant vector store for collection '{self.qdrant_collection}'")
+        # Try Google Embeddings first if API key is available
+        if google_api_key:
+             try:
+                 self.embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_api_key)
+                 logger.info("Using GoogleGenerativeAIEmbeddings.")
+             except Exception as e:
+                  logger.warning(f"Failed to initialize GoogleGenerativeAIEmbeddings: {e}. Falling back to SentenceTransformer.")
+                  self.embeddings = None # Ensure fallback
+
+        # Fallback or default to SentenceTransformer
+        if not self.embeddings:
+            try:
+                self._st_model = SentenceTransformer(self.embedding_model_name)
+                logger.info(f"Using SentenceTransformer '{self.embedding_model_name}' directly.")
+            except ImportError:
+                logger.error("SentenceTransformers library not found. Install it (`pip install sentence-transformers`) for embedding.")
+                raise
+            except Exception as e:
+                logger.error(f"Failed to load SentenceTransformer model '{self.embedding_model_name}': {e}")
+                raise
         
+        # LangChain Vector Store (mainly for potential future use or other LangChain integrations)
+        # We will primarily use direct Qdrant client search for retrieval with SentenceTransformer
+        # Note: The ValueError about embeddings=None is avoided by not relying on it for ST retrieval
+        try:
+            self.vector_store = Qdrant(
+                client=self.qdrant_client,
+                collection_name=self.qdrant_collection,
+                # Pass embeddings only if using a Langchain compatible one (like Google's)
+                embeddings=self.embeddings if self.embeddings else None 
+            )
+            logger.info(f"Initialized LangChain Qdrant vector store wrapper for collection '{self.qdrant_collection}'.")
+        except ValueError as e:
+             logger.warning(f"Could not initialize LangChain Qdrant VectorStore (this is expected if using SentenceTransformer directly for retrieval): {e}")
+             self.vector_store = None # Indicate it's not fully usable for retrieval in ST mode
+
         # Initialize LLM (Gemini)
         if not google_api_key:
             google_api_key = os.environ.get("GOOGLE_API_KEY")
@@ -216,42 +222,53 @@ class QueryPipeline:
         logger.info(f"Retrieving top {top_k} regulations for query: '{query[:100]}...'")
         
         results_with_scores = []
-        if self.embeddings:
-             # Use LangChain retriever with built-in embedding function
-             retriever = self.vector_store.as_retriever(
-                 search_type="similarity_score_threshold",
-                 search_kwargs={'k': top_k, 'score_threshold': score_threshold or 0.7} # Default threshold 0.7
-             )
-             docs = retriever.get_relevant_documents(query)
-             # Note: Langchain retriever might not return scores directly in this mode easily.
-             # We might need to use similarity_search_with_score instead.
-             results_with_scores_lc = self.vector_store.similarity_search_with_score(
-                  query=query, k=top_k, score_threshold=score_threshold or 0.7
-             )
-             results_with_scores = [
-                 {"text": doc.page_content, "metadata": doc.metadata, "score": score}
-                 for doc, score in results_with_scores_lc
-             ]
 
-        elif hasattr(self, '_st_model'):
-            # Manually embed the query and search Qdrant directly
+        # Use SentenceTransformer if it's initialized
+        if self._st_model:
+            logger.info("Using SentenceTransformer and direct Qdrant client for retrieval.")
             query_vector = self._st_model.encode(query).tolist()
-            search_result = self.qdrant_client.search(
-                collection_name=self.qdrant_collection,
-                query_vector=query_vector,
-                query_filter=None, # Add filters if needed
-                limit=top_k,
-                score_threshold=score_threshold or 0.7 # Default threshold 0.7
-            )
-            results_with_scores = [
-                {"text": hit.payload.get("text", ""), "metadata": hit.payload, "score": hit.score}
-                for hit in search_result
-            ]
+            try:
+                search_result = self.qdrant_client.search(
+                    collection_name=self.qdrant_collection,
+                    query_vector=query_vector,
+                    query_filter=None, # Add filters if needed
+                    limit=top_k,
+                    score_threshold=score_threshold # Let Qdrant handle None threshold if needed
+                )
+                results_with_scores = [
+                    # Payload is already flat due to ingestion fix
+                    {"text": hit.payload.get("text", ""), "metadata": hit.payload, "score": hit.score} 
+                    for hit in search_result
+                ]
+            except Exception as e:
+                 logger.error(f"Qdrant search failed: {e}")
+                 # Handle error appropriately, maybe return empty list or raise
+                 return []
+
+        # Use Langchain retriever if Google embeddings are available and ST model is not
+        elif self.embeddings and self.vector_store:
+            logger.info("Using LangChain VectorStore with Google Embeddings for retrieval.")
+            try:
+                # Use similarity_search_with_score for consistency
+                results_with_scores_lc = self.vector_store.similarity_search_with_score(
+                    query=query, k=top_k, score_threshold=score_threshold or 0.0 # Adjust threshold as needed for Google Embeddings
+                )
+                results_with_scores = [
+                    {"text": doc.page_content, "metadata": doc.metadata, "score": score}
+                    for doc, score in results_with_scores_lc
+                ]
+            except Exception as e:
+                 logger.error(f"LangChain vector store search failed: {e}")
+                 return []
+        
         else:
-             logger.error("No valid embedding method available for retrieval.")
+             logger.error("No valid embedding/retrieval method configured.")
              return []
-             
-        logger.info(f"Retrieved {len(results_with_scores)} regulations.")
+
+        logger.info(f"Retrieved {len(results_with_scores)} documents.")
+        # Sort by score descending just in case Qdrant doesn't guarantee it (though it usually does)
+        results_with_scores.sort(key=lambda x: x['score'], reverse=True)
+        
         return results_with_scores
 
     def analyze_compliance(self, document_chunk: str, regulations: List[Dict]) -> str:
@@ -415,7 +432,7 @@ def parse_args():
     parser.add_argument(
         "--embedding-model",
         type=str,
-        default="all-mpnet-base-v2",
+        default="msmarco-distilbert-base-tas-b",
         help="Name of the embedding model to use"
     )
     

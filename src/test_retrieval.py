@@ -19,7 +19,7 @@ def test_retrieval(query: str = "card tokenisation", top_k: int = 5, threshold: 
     logger.info(f"Connected to Qdrant at localhost:6333")
     
     # Use SentenceTransformer for embeddings
-    embedding_model_name = "all-mpnet-base-v2"
+    embedding_model_name = "msmarco-distilbert-base-tas-b"
     st_model = SentenceTransformer(embedding_model_name)
     logger.info(f"Using SentenceTransformer '{embedding_model_name}' for query embedding.")
     
