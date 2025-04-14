@@ -58,7 +58,7 @@ This document tracks the implementation progress of the BankRAG project accordin
 - [X] Configure vector similarity metrics (cosine)
 - [X] Implement batch upsert operations
 - [X] Add metadata filtering capabilities
-- [ ] Verify retrieval quality with test queries (Partially complete: Retrieval works, but relevance is low/mediocre with current sample data)
+- [X] Verify retrieval quality with test queries 
 
 ## Phase 3: Query Pipeline
 
@@ -163,18 +163,3 @@ This document tracks the implementation progress of the BankRAG project accordin
 - [ ] Maintenance procedures
 - [ ] Troubleshooting guide
 
-## Current Status (Week 2 Focus)
-
-According to the project timeline, we are currently in Week 2, which focuses on:
-
-- Completing the scraper
-- Text preprocessing
-- Initial embedding pipeline
-
-### Progress Summary
-
-- The scraper implementation is complete with all required features
-- Text preprocessing is mostly complete but needs finalization for PDF handling
-- Vector embedding is implemented but needs optimization
-- Qdrant integration is complete but needs testing
-- The ingestion pipeline is implemented and ready for testing

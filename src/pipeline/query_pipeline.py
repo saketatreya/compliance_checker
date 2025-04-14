@@ -1,4 +1,5 @@
 import os
+
 import logging
 import argparse
 from pathlib import Path
@@ -24,6 +25,7 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGener
 from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from collections import defaultdict
 
 # Configure logging
 logging.basicConfig(
@@ -31,6 +33,11 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Text Splitter Configuration
+TEXT_SPLITTER_CHUNK_SIZE = 1000
+TEXT_SPLITTER_CHUNK_OVERLAP = 200
+TEXT_SPLITTER_SEPARATORS = ["\n\n", "\n", ". ", " ", ""]
 
 class QueryPipeline:
     """End-to-end pipeline for analyzing document compliance.
@@ -122,35 +129,94 @@ class QueryPipeline:
             self.compliance_prompt = PromptTemplate(
                 input_variables=["context", "document"],
                 template="""You are an expert AI assistant specialized in RBI regulations and banking compliance.
-                You will be given excerpts from RBI regulatory documents ('Context') and a section of a bank's internal policy ('Bank's Policy Section').
-                Your task is to assess whether the Bank's Policy Section complies with the provided RBI Regulations context.
+                You will be given relevant excerpts from RBI regulatory documents ('Context') and a section of a bank's internal policy document ('Bank's Policy Section').
+                Your task is to provide a clear and intuitive compliance assessment.
 
                 **Instructions:**
-                1.  Carefully analyze the Bank's Policy Section against EACH relevant point in the RBI Regulations context.
-                2.  Base your analysis STRICTLY on the provided text. Do NOT assume prior knowledge or regulations not present in the Context.
-                3.  Identify any specific areas of non-compliance, potential compliance issues, or confirm compliance.
-                4.  For each point of analysis (compliance confirmed, issue identified), CLEARLY CITE the relevant regulation from the Context using the provided source identifier (e.g., [Source: Doc 1], [Source: Doc 2, Clause 5]).
-                5.  If the provided Context does not contain information to assess a specific part of the policy, explicitly state that you cannot determine compliance for that part based on the given context.
-                6.  Structure your response EXACTLY as follows:
+                1.  Carefully compare the Bank's Policy Section against the specific points in the RBI Regulations Context.
+                2.  Base your analysis STRICTLY on the provided text. Do NOT use outside knowledge.
+                3.  Apply the following PRECISE classification rules for compliance findings:
+                    - "Compliant": The policy explicitly covers all requirements specified in the regulation in a manner that aligns with regulatory intent.
+                    - "Partially Compliant": The policy addresses some aspects of the requirement but has gaps or is unclear. This MUST ONLY be used when a specific relevant regulation is found in the provided context.
+                    - "Non-Compliant": ONLY use when the policy DIRECTLY CONTRADICTS a clear requirement in the regulation (e.g., policy says annual review when regulation requires quarterly). 
+                    - "Unable to Assess": Use this when ANY of these conditions are true:
+                       a) The regulation requires something but the policy doesn't mention it at all
+                       b) There is insufficient context to determine compliance
+                       c) IMPORTANT: When 'No relevant regulation provided in context' - if you cannot find a specific regulation that addresses the policy aspect, you MUST classify it as "Unable to Assess"
+                4.  For EVERY point you assess, you MUST cite the specific regulation text from the Context that supports your finding (e.g., citing the regulation number/clause if available, or quoting a relevant phrase) OR explicitly state 'No relevant regulation provided in context'.
+                5.  CRITICAL RULE: If your supporting regulation states 'No relevant regulation provided in context', then your finding MUST ALWAYS be 'Unable to Assess' - never Compliant, Partially Compliant, or Non-Compliant.
+                6.  Calculate an overall compliance percentage for this section: Fully Compliant items count as 100%, Partially Compliant as 50%, Non-Compliant as 0%, and Cannot Assess items are excluded from the calculation.
+                7.  Assign a severity level (High, Medium, Low) to each non-compliant or partially compliant item based on potential impact.
+                8.  Determine the most appropriate title for this policy section by identifying the main subject matter being addressed. The title should be:
+                    - Brief and concise (2-5 words)
+                    - Descriptive of the main topic (e.g., "Suspicious Transaction Reporting", "Customer Due Diligence", "Risk Assessment Procedures")
+                    - In title case format
+                    - NEVER start with section numbers or letters like "A.", "B.", "1.", "2." etc.
+                    - DO NOT copy the first sentence or line from the policy document
+                    - DO NOT include any policy text verbatim
+                    - Create a completely new title that describes the TOPIC only
+                    - Examples of good titles: "Counterfeit Currency Reporting", "KYC Documentation", "AML Monitoring Procedures"
+                    - Examples of bad titles: "A. The Bank shall report...", "1.2 All transactions must be..."
+                9.  Structure your response EXACTLY using the following Markdown format:
 
-                **1. Summary:** A brief one-sentence overview (e.g., Compliant, Non-Compliant, Potential Issues Found).
-                **2. Compliance Issues:** List each identified issue OR state 'No compliance issues identified based on the provided context.'
-                   - Issue 1: [Description of issue] (Relevant Regulation: [Citation from Context]).
-                   - Issue 2: [Description of issue] (Relevant Regulation: [Citation from Context]).
-                **3. Compliance Confirmation:** List areas where the policy IS compliant with the context OR state 'No specific compliant areas noted' if focusing only on issues.
-                   - Point 1: [Description of compliant aspect] (Relevant Regulation: [Citation from Context]).
-                **4. Areas of Uncertainty:** List parts of the policy that cannot be assessed due to lack of relevant information in the Context OR state 'All parts of the policy section could be assessed against the provided context.'
-                   - Uncertainty 1: [Description of policy part] (Reason: No relevant regulation provided in context).
-                **5. Recommendations:** (Optional) Suggest specific changes ONLY if non-compliance was found.
+                **1. Compliance Summary:**
+                - Section Title: [Extracted section title based on content analysis]
+                - Overall Compliance: [Percentage]% ([Verdict]: e.g., Largely Compliant, Significant Issues Found, Minor Issues Found, Fully Compliant)
+                - Number of Policy Aspects Assessed: [Number]
+                - Compliant Items: [Number] ([Percentage]%)
+                - Partially Compliant Items: [Number] ([Percentage]%)
+                - Non-Compliant Items: [Number] ([Percentage]%)
+                - Items Unable to Assess: [Number]
 
-                **Context:**
-                RBI Regulations:
+                **2. Prioritized Action Items:**
+                [If no action items are needed, state: "No action items required - policy is fully compliant with available regulations."]
+                [Otherwise, list action items in order of severity (High to Low):]
+                1. [High Severity] [Policy Aspect]: [Brief actionable recommendation]
+                2. [Medium Severity] [Policy Aspect]: [Brief actionable recommendation]
+                3. [Low Severity] [Policy Aspect]: [Brief actionable recommendation]
+
+                **3. Detailed Assessment:**
+                - Evaluate key aspects of the Bank's Policy Section against the Context.
+                - For each aspect:
+                    - State the policy aspect being evaluated.
+                    - State your finding (Compliant, Non-Compliant, Partially Compliant, Unable to Assess) using EXACTLY the classification rules above.
+                    - If non-compliant or partially compliant, include severity (High, Medium, Low).
+                    - Provide a brief explanation.
+                    - **Crucially, cite the supporting RBI Regulation text from the Context or state 'No relevant regulation provided in context'.**
+                - Example Format:
+                    - Policy Aspect: [e.g., Customer identification procedure]
+                    - Finding: [e.g., Compliant]
+                    - Explanation: [e.g., The policy aligns with the requirement for...] 
+                    - Supporting Regulation: [e.g., Context Reference ID: XXX, Clause Y: "Quote..."]
+                    
+                    - Policy Aspect: [e.g., Risk categorization frequency]
+                    - Finding: [e.g., Non-Compliant] - Severity: [High]
+                    - Explanation: [e.g., The policy states annual review, but the regulation requires semi-annual...]
+                    - Supporting Regulation: [e.g., Context Reference ID: ZZZ, Section A: "Quote..."]
+
+                **4. Areas of Uncertainty:**
+                - List any specific parts of the Bank's Policy Section that could NOT be assessed for compliance because relevant information was missing from the provided Context.
+                - If all aspects could be assessed, state: '- All relevant parts of the policy section could be assessed against the provided context.'
+                - Format: '- [Policy Aspect]: Cannot assess due to missing context regarding [specific topic].'
+
+                **5. Actionable Recommendations:**
+                - ONLY if non-compliance or partial compliance was identified, suggest specific, actionable changes to the Bank's Policy Section to bring it into alignment with the cited regulations.
+                - Include the severity level with each recommendation in format: "[Severity: High/Medium/Low]"
+                - If fully compliant or only uncertainties were found, state: '- No specific recommendations required based on this assessment.'
+                - Format: '- [Severity: High/Medium/Low] For [Policy Aspect with Issue], recommend updating the policy to [specific change] to align with [Cited Regulation].'
+
+
+                **Context (RBI Regulations):**
+                ```
                 {context}
+                ```
 
                 **Bank's Policy Section:**
+                ```
                 {document}
+                ```
 
-                **Analysis:**
+                **Compliance Analysis:**
                 """
             )
             
@@ -166,76 +232,154 @@ class QueryPipeline:
         self.doc_processor = TextProcessor() # Using the combined processor for now
         logger.info("Initialized document processor.")
 
-    def _process_user_document(self, document_path: str) -> List[str]:
-        """Process the user's document into text chunks using RecursiveCharacterTextSplitter."""
-        logger.info(f"Processing user document: {document_path}")
+    def _process_user_document(self, document_path: str) -> List[Dict]:
+        """Processes the user's document into chunks, preserving section context.
+
+        For PDFs, it uses the already chunked output from PDFProcessor.
+        For other types (HTML, TXT, DOCX), it gets sections and chunks them here.
+
+        Returns:
+            List of chunk dictionaries, each containing at least:
+            {'id': chunk_id, 'text': chunk_content, 'metadata': {..., 'section_title': title, ...}}
+        """
+        logger.info(f"Processing user document into section-aware chunks: {document_path}")
         file_ext = Path(document_path).suffix.lower()
-        full_text = ""
+        all_chunks = [] # Initialize chunk list
 
         try:
+            # 1. Process based on file type
             if file_ext == ".pdf":
-                pdf_chunks = self.doc_processor.pdf_processor.process_document(document_path)
-                full_text = "\n\n".join([chunk['text'] for chunk in pdf_chunks]) # Join pages/chunks first
-            elif file_ext == ".html" or file_ext == ".htm":
-                html_chunks = self.doc_processor.html_processor.process_document(document_path)
-                full_text = " ".join([chunk['text'] for chunk in html_chunks])
-            elif file_ext == ".txt":
-                with open(document_path, "r", encoding="utf-8") as f:
-                    full_text = f.read()
-            elif file_ext == ".docx":
-                try:
-                    import docx
-                    doc = docx.Document(document_path)
-                    full_text = "\n".join([para.text for para in doc.paragraphs])
-                except ImportError:
-                    logger.error("python-docx library not found. Install it (`pip install python-docx`) to process .docx files.")
-                    raise
-                except Exception as e:
-                    logger.error(f"Error processing DOCX file {document_path}: {e}")
-                    raise
+                # PDF processor ALREADY returns chunk dictionaries with id, text, metadata
+                all_chunks = self.doc_processor.pdf_processor.process_document(document_path)
+                if not all_chunks:
+                     logger.warning(f"PDF document {document_path} yielded no chunks.")
+                # No further splitting needed for PDF files here
+
+            elif file_ext in [".html", ".htm", ".txt", ".docx"]: # Handle types that need splitting here
+                sections = []
+                # --- Get sections for these types ---
+                if file_ext == ".html" or file_ext == ".htm":
+                    # Assuming html_processor.process_document returns list of section dicts
+                    # with keys like 'section_title', 'section_text', 'metadata'
+                    sections = self.doc_processor.html_processor.process_document(document_path)
+                elif file_ext == ".txt":
+                    # Treat the whole document as one section
+                    with open(document_path, "r", encoding="utf-8") as f:
+                        full_text = f.read()
+                    doc_name = Path(document_path).name
+                    sections = [{
+                        "section_title": doc_name,
+                        "section_text": full_text,
+                        "metadata": { # Basic metadata for TXT
+                             "document_type": "txt",
+                             "source_file": str(document_path),
+                             "file_name": doc_name, # Ensure file_name is present
+                             "reference_id": f'TXT_REF_{Path(document_path).stem}'
+                        }
+                    }]
+                elif file_ext == ".docx":
+                    # Treat the whole document as one section
+                    try:
+                        import docx
+                        doc = docx.Document(document_path)
+                        full_text = "\n".join([para.text for para in doc.paragraphs])
+                        doc_name = Path(document_path).name
+                        sections = [{
+                            "section_title": doc_name,
+                            "section_text": full_text,
+                            "metadata": { # Basic metadata for DOCX
+                                 "document_type": "docx",
+                                 "source_file": str(document_path),
+                                 "file_name": doc_name, # Ensure file_name is present
+                                 "reference_id": f'DOCX_REF_{Path(document_path).stem}'
+                            }
+                        }]
+                    except ImportError:
+                        logger.error("python-docx not found. Install it (`pip install python-docx`) to process .docx files.")
+                        raise
+                    except Exception as e:
+                        logger.error(f"Error processing DOCX file {document_path}: {e}")
+                        raise
+                # --- End getting sections ---
+
+                if not sections:
+                    logger.warning(f"Document {document_path} (type: {file_ext}) yielded no sections.")
+                    return []
+
+                # --- Splitting logic needed ONLY for non-PDF types that provide sections ---
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=TEXT_SPLITTER_CHUNK_SIZE,
+                    chunk_overlap=TEXT_SPLITTER_CHUNK_OVERLAP,
+                    length_function=len,
+                    is_separator_regex=False,
+                    separators=TEXT_SPLITTER_SEPARATORS
+                )
+
+                # Iterate through sections and chunk their text
+                chunk_counter = 0
+                for section in sections:
+                    section_title = section.get("section_title", "Unnamed Section")
+                    section_text = section.get("section_text", "")
+                    # Start with metadata from the section itself
+                    base_chunk_metadata = section.get("metadata", {}).copy()
+                    base_chunk_metadata["section_title"] = section_title # Ensure section title is in metadata
+
+                    if not section_text.strip():
+                        continue # Skip empty sections
+
+                    chunks_from_section = text_splitter.split_text(section_text)
+
+                    # Create chunk dictionaries mimicking PDFProcessor output structure
+                    for i, chunk_text in enumerate(chunks_from_section):
+                        chunk_metadata = base_chunk_metadata.copy()
+                        chunk_metadata["chunk_index_in_section"] = i
+                        # Clean the text for the final chunk
+                        cleaned_chunk_text = self.doc_processor.pdf_processor._clean_text(chunk_text) # Reuse cleaning
+                        chunk_metadata["text"] = cleaned_chunk_text # Also store cleaned text in metadata like PDFProcessor does
+
+                        # Generate a unique ID
+                        ref_id = chunk_metadata.get('reference_id', f'UNKNOWN_{file_ext.upper()}')
+                        chunk_id = f"{ref_id}_chunk_{chunk_counter}"
+                        chunk_counter += 1
+
+                        chunk_dict = {
+                            "id": chunk_id,
+                            "text": cleaned_chunk_text, # Text for embedding
+                            "metadata": chunk_metadata
+                        }
+                        all_chunks.append(chunk_dict)
+                # --- End splitting logic for non-PDF ---
+
             else:
                 logger.error(f"Unsupported document format: {file_ext}")
                 raise ValueError(f"Unsupported document format: {file_ext}")
 
-            if not full_text.strip():
-                logger.warning(f"Document {document_path} appears to be empty after text extraction.")
-                return []
-
-            # Use RecursiveCharacterTextSplitter for chunking
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,  # Target size for chunks
-                chunk_overlap=200, # Overlap between chunks
-                length_function=len,
-                is_separator_regex=False,
-                separators=["\n\n", "\n", ". ", " ", ""] # Common separators
-            )
-            
-            final_chunks = text_splitter.split_text(full_text)
-            logger.info(f"Processed document into {len(final_chunks)} chunks using RecursiveCharacterTextSplitter.")
-            return final_chunks
+            # Log final count using the unified all_chunks list
+            logger.info(f"Processed document {document_path} into {len(all_chunks)} chunks.")
+            return all_chunks
 
         except Exception as e:
-             logger.error(f"Failed to process document {document_path}: {e}")
+             logger.error(f"Failed to process document {document_path}: {e}", exc_info=True)
              return [] # Return empty list on error
 
-    def retrieve_relevant_regulations(self, query: str, top_k: int = 5, score_threshold: Optional[float] = None) -> List[Dict]:
+    def retrieve_relevant_regulations(self, query_text: str, top_k: int = 5, score_threshold: Optional[float] = None) -> List[Dict]:
         """Retrieve relevant regulations from Qdrant.
         
         Args:
-            query: Text query (e.g., a chunk from the user's document)
+            query_text: Text query (e.g., a chunk's content from the user's document)
             top_k: Number of relevant documents to retrieve
             score_threshold: Minimum similarity score to consider
         Returns:
             List of retrieved regulations (documents with metadata and score)
         """
-        logger.info(f"Retrieving top {top_k} regulations for query: '{query[:100]}...'")
+        logger.info(f"Retrieving top {top_k} regulations for query: '{query_text[:100]}...'")
         
         results_with_scores = []
 
         # Use SentenceTransformer if it's initialized
         if self._st_model:
             logger.info("Using SentenceTransformer and direct Qdrant client for retrieval.")
-            query_vector = self._st_model.encode(query).tolist()
+            query_vector = self._st_model.encode(query_text).tolist()
             try:
                 search_result = self.qdrant_client.search(
                     collection_name=self.qdrant_collection,
@@ -260,7 +404,7 @@ class QueryPipeline:
             try:
                 # Use similarity_search_with_score for consistency
                 results_with_scores_lc = self.vector_store.similarity_search_with_score(
-                    query=query, k=top_k, score_threshold=score_threshold or 0.0 # Adjust threshold as needed for Google Embeddings
+                    query=query_text, k=top_k, score_threshold=score_threshold or 0.0 # Adjust threshold as needed for Google Embeddings
                 )
                 results_with_scores = [
                     {"text": doc.page_content, "metadata": doc.metadata, "score": score}
@@ -317,115 +461,157 @@ class QueryPipeline:
             logger.error(f"Error during LLM analysis: {e}")
             return f"Error during analysis: {e}"
 
-    def analyze_document(self, document_path: str, top_k: int = 5, score_threshold: Optional[float] = None) -> Dict:
-        """Run the full query pipeline for a given document.
-        
-        Args:
-            document_path: Path to the user document
-            top_k: Number of relevant regulations to retrieve per chunk
-            score_threshold: Minimum similarity score
-            
-        Returns:
-            Dictionary containing analysis results for each chunk and overall info
-        """
+    def analyze_document(self, document_path: str, top_k: int = 5, score_threshold: Optional[float] = None, progress_callback: Optional[callable] = None) -> Dict:
+        """Analyzes the document section by section against RBI regulations."""
         logger.info(f"Starting analysis for document: {document_path}")
-        
+
         try:
-            # Process document into chunks
-            doc_chunks = self._process_user_document(document_path)
-            
-            if not doc_chunks:
-                return {"error": "Failed to process document or document is empty."}
-            
-            chunk_analyses = []
-            all_retrieved_regulations = []
-            
-            # Analyze each chunk
-            for i, chunk in enumerate(tqdm(doc_chunks, desc="Analyzing document chunks")):
-                # Retrieve relevant regulations for the chunk
+            # 1. Process document into section-aware chunks
+            doc_chunks_with_context = self._process_user_document(document_path)
+
+            if not doc_chunks_with_context:
+                logger.error(f"Document {document_path} yielded no chunks.")
+                return {"error": "Failed to process document or document is empty/yielded no chunks."}
+
+            # 2. Group chunks by section title
+            sections = defaultdict(list) # {section_title: [chunk_dict, chunk_dict, ...]}
+            for chunk_data in doc_chunks_with_context:
+                sections[chunk_data['metadata']['section_title']].append(chunk_data)
+            logger.info(f"Grouped {len(doc_chunks_with_context)} chunks into {len(sections)} sections for analysis.")
+
+            section_analyses = [] # Holds analysis results for each SECTION
+            all_retrieved_regulations = set() # Unique regulation refs across all sections
+
+            # 3. Analyze each section
+            total_sections = len(sections)
+            for i, (section_title, chunks_in_section) in enumerate(tqdm(sections.items(), desc="Analyzing document sections")):
+                
+                # Combine text from all chunks within the section
+                section_full_text = "\n\n".join([chunk['text'] for chunk in chunks_in_section])
+                
+                # Use metadata from the *first* chunk as representative for the section
+                # (Assumes metadata like page numbers are consistent or start/end are captured)
+                representative_metadata = chunks_in_section[0].get('metadata', {})
+
+                if not section_full_text.strip():
+                    logger.warning(f"Skipping empty section: {section_title}")
+                    continue
+
+                # Retrieve relevant regulations for the *entire section's text*
                 regulations = self.retrieve_relevant_regulations(
-                    query=chunk,
+                    query_text=section_full_text, # Use combined text
                     top_k=top_k,
                     score_threshold=score_threshold
                 )
-                all_retrieved_regulations.extend(regulations) # Collect all for summary
-            
-            # Analyze compliance
-                analysis_text = self.analyze_compliance(chunk, regulations)
-            
-            chunk_analyses.append({
-                "chunk_index": i,
-                "chunk_text": chunk,
-                "regulations": regulations,
-                    "analysis": analysis_text
+                for reg in regulations:
+                    ref_id = reg.get('metadata', {}).get('reference_id')
+                    if ref_id:
+                        all_retrieved_regulations.add(ref_id)
+
+                # Analyze compliance for the *entire section* against its relevant regulations
+                # *** This is now ONE LLM call per section ***
+                try:
+                    analysis_text = self.analyze_compliance(section_full_text, regulations)
+                except Exception as llm_error:
+                    logger.error(f"LLM analysis failed for section '{section_title}': {llm_error}", exc_info=True)
+                    analysis_text = f"Error during analysis: {llm_error}" # Record error in output
+                    # Decide if you want to stop the whole process or continue with other sections
+                    # For now, we continue and record the error.
+                
+                # Store the analysis result for the section
+                section_analyses.append({
+                    "section_index": i,
+                    "section_title": section_title,
+                    "section_text": section_full_text, # Store combined text if needed later
+                    "section_metadata": representative_metadata, # Store representative metadata
+                    "retrieved_regulations": regulations, # Regulations retrieved for this section
+                    "analysis_text": analysis_text # LLM analysis for this section
                 })
-            
-            # Consolidate results
-            # Find unique regulations cited across all chunks
-            unique_regs = {json.dumps(reg['metadata']): reg for reg in all_retrieved_regulations}
-            
+
+                # --- Update Progress (based on sections now) ---
+                if progress_callback:
+                    progress = (i + 1) / total_sections
+                    status = f"Analyzing section {i+1}/{total_sections}: {section_title}"
+                    logger.info(status) # Log the status message
+                    try:
+                        # Pass only the progress value (float) to the callback
+                        progress_callback(progress)
+                    except Exception as cb_err:
+                        # Update the warning message to be more informative
+                        logger.warning(f"Progress callback failed with value {progress}: {cb_err}")
+
+            # --- Consolidate Results --- 
             results = {
-            "document_path": document_path,
-                "num_chunks": len(doc_chunks),
-            "chunk_analyses": chunk_analyses,
-                "all_regulations": list(unique_regs.values()) # List of unique regulations used
+                "document_path": document_path,
+                "parameters": {"top_k": top_k, "score_threshold": score_threshold}, # Include parameters
+                "section_analyses": section_analyses, 
+                # Optional: Add other summary info if needed
+                # "unique_regulation_refs": list(all_retrieved_regulations) 
             }
-            
-            logger.info(f"Analysis complete for {document_path}")
+
+            logger.info(f"Analysis complete for {document_path}. Analyzed {len(section_analyses)} sections.")
             return results
-            
+
         except Exception as e:
-            logger.error(f"Error during query pipeline execution for {document_path}: {e}")
-            return {"error": str(e)}
-    
-    def format_analysis_report(self, analysis_result: Dict[str, Any]) -> str:
-        """Format analysis result into a readable report.
-        
-        Args:
-            analysis_result: Result from analyze_document
-            
-        Returns:
-            Formatted report as text
-        """
-        document_path = analysis_result["document_path"]
-        num_chunks = analysis_result["num_chunks"]
-        all_regulations = analysis_result["all_regulations"]
-        chunk_analyses = analysis_result["chunk_analyses"]
-        
-        # Build report
-        report = []
-        report.append(f"# Compliance Analysis Report")
-        report.append(f"## Document: {Path(document_path).name}")
-        report.append(f"")
-        
-        # Summary of regulations referenced
-        report.append(f"## Referenced RBI Regulations")
-        for i, reg in enumerate(all_regulations, 1):
-            metadata = reg.get("metadata", {})
-            ref_id = metadata.get("reference_id", "Unknown Reference")
-            report.append(f"{i}. {ref_id}")
-        report.append(f"")
-        
-        # Detailed analysis by chunk
-        report.append(f"## Detailed Analysis")
-        
-        for chunk_analysis in chunk_analyses:
-            chunk_index = chunk_analysis["chunk_index"]
-            chunk_text = chunk_analysis["chunk_text"]
-            analysis = chunk_analysis["analysis"]
-            
-            report.append(f"### Section {chunk_index + 1}")
-            report.append(f"")
-            report.append(f"**Text Excerpt:**")
-            report.append(f"```")
-            report.append(chunk_text[:200] + "..." if len(chunk_text) > 200 else chunk_text)
-            report.append(f"```")
-            report.append(f"")
-            report.append(f"**Analysis:**")
-            report.append(analysis)
-            report.append(f"")
-        
-        return "\n".join(report)
+            logger.error(f"Error during document analysis for {document_path}: {e}", exc_info=True)
+            return {"error": f"An unexpected error occurred: {e}"}
+
+    def format_analysis_report(self, analysis_results: Dict) -> str:
+        """Formats the analysis results into a readable Markdown report, skipping uninformative sections."""
+        report_parts = []
+        skipped_sections_count = 0
+        total_sections = 0
+
+        # Add header with parameters
+        params = analysis_results.get('parameters', {})
+        report_parts.append(f"# Compliance Analysis Report")
+        report_parts.append(f"**Document:** `{analysis_results.get('document_path', 'N/A')}`")
+        report_parts.append(f"**Analysis Parameters:** Top K={params.get('top_k', 'N/A')}, Threshold={params.get('score_threshold', 'N/A')}")
+        report_parts.append("***")
+
+        if "section_analyses" in analysis_results:
+            total_sections = len(analysis_results["section_analyses"])
+            for i, section_data in enumerate(analysis_results["section_analyses"]):
+                section_title = section_data.get("section_title", f"Section {i+1}")
+                analysis_text = section_data.get("analysis_text", "Analysis not available.") 
+                retrieved_regs = section_data.get("retrieved_regulations", [])
+                section_text_preview = section_data.get("section_text", "")[:300] # Preview first 300 chars
+
+                # --- Check if section should be skipped --- 
+                is_fully_compliant = "Overall Assessment:**\n- Fully Compliant" in analysis_text
+                no_recommendations_needed = "Actionable Recommendations:**\n- No specific recommendations required" in analysis_text
+
+                if is_fully_compliant and no_recommendations_needed:
+                    skipped_sections_count += 1
+                    continue # Skip adding this section to the report
+
+                # --- Add Section Details (Markdown) --- 
+                report_parts.append(f"## Section: {section_title}")
+                
+                # Add policy text preview in a code block
+                report_parts.append("**Original Policy Text (Preview):**")
+                report_parts.append(f"```\n{section_text_preview}{'...' if len(section_data.get('section_text', '')) > 300 else ''}\n```")
+
+                # Add retrieved regulations as a list
+                report_parts.append("**Retrieved Regulations:**")
+                if retrieved_regs:
+                    reg_markdown = "\n".join([f"- **[{reg['metadata'].get('source', 'Unknown Source')}, Page {reg['metadata'].get('page_number', 'N/A')}]**: ...{reg['text'][:150]}..." for reg in retrieved_regs])
+                    report_parts.append(reg_markdown)
+                else:
+                    report_parts.append("- None")
+
+                # Add LLM Analysis (already formatted as Markdown)
+                report_parts.append("### Compliance Assessment")
+                report_parts.append(analysis_text)
+                report_parts.append("***") # Separator between sections
+
+        if skipped_sections_count == total_sections and total_sections > 0:
+            report_parts.append("**Overall Result:** All sections were found to be fully compliant with the retrieved regulations, and no specific recommendations were necessary based on the provided context.")
+        elif skipped_sections_count > 0:
+             report_parts.append(f"*Note: {skipped_sections_count} section(s) were omitted from this report as they were fully compliant with no recommendations.*")
+
+
+        return "\n\n".join(report_parts)
 
 
 def parse_args():
@@ -486,12 +672,12 @@ if __name__ == "__main__":
             print(f"Error: {analysis_results['error']}")
         else:
             print(f"Analysis Results for: {analysis_results['document_path']}")
-            for chunk_result in analysis_results["chunk_analyses"]:
-                print(f"\n--- Chunk {chunk_result['chunk_index'] + 1} ---")
-                print(f"Text: {chunk_result['chunk_text'][:100]}...")
+            for chunk_result in analysis_results["section_analyses"]:
+                print(f"\n--- Section {chunk_result['section_index'] + 1} ---")
+                print(f"Text: {chunk_result['section_text'][:100]}...")
                 print("Analysis:")
-                print(chunk_result["analysis"])
-                print(f"Retrieved {len(chunk_result['regulations'])} regulations.")
+                print(chunk_result["analysis_text"])
+                print(f"Retrieved {len(chunk_result['retrieved_regulations'])} regulations.")
                 
         # Clean up dummy file
         # os.remove(dummy_doc_path)
