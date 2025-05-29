@@ -29,31 +29,50 @@ class QdrantRetriever:
         collection_name: str = "rbi_regulations",
         embedding_dim: int = 768,
         url: Optional[str] = None,
-        port: Optional[int] = 6333,
-        input_dir: str = "data/embeddings"
+        port: Optional[int] = None, # Qdrant Cloud URL usually includes the port or uses a default
+        api_key: Optional[str] = None, # Added for Qdrant Cloud
+        input_dir: str = "data/embeddings",
+        qdrant_batch_size: int = 100 # Added qdrant_batch_size
     ):
         """Initialize the Qdrant retriever.
         
         Args:
             collection_name: Name of the Qdrant collection
             embedding_dim: Dimension of the embedding vectors
-            url: URL of the Qdrant server (None for local)
-            port: Port of the Qdrant server
-            input_dir: Directory containing embedded chunks
+            url: URL of the Qdrant server (None for local). For Qdrant Cloud, include http/https.
+            port: Port of the Qdrant server (often not needed if url includes it or for cloud default).
+            api_key: API key for Qdrant Cloud.
+            input_dir: Directory containing embedded chunks (for local ingestion to cloud)
+            qdrant_batch_size: Batch size for upserting points to Qdrant
         """
         self.collection_name = collection_name
         self.embedding_dim = embedding_dim
         self.input_dir = Path(input_dir)
+        self.qdrant_batch_size = qdrant_batch_size # Store batch size
         
         # Initialize Qdrant client
         if url:
-            self.client = QdrantClient(url=url, port=port)
-            logger.info(f"Connected to Qdrant at {url}:{port}")
+            _port = port # Use the provided port if any
+            if "cloud.qdrant.io" in url: # It's a Qdrant Cloud URL
+                if url.startswith("https://"):
+                    _port = 6333 # Try Qdrant Cloud REST API over HTTPS on port 6333
+                    logger.info(f"QdrantRetriever: Detected Qdrant Cloud URL (HTTPS). Forcing port to {_port} for REST-like API.")
+                elif url.startswith("http://"): # Though unlikely for cloud
+                    _port = 6333 
+                    logger.info(f"QdrantRetriever: Detected Qdrant Cloud URL (HTTP). Forcing port to {_port}.")
+
+            if _port:
+                 self.client = QdrantClient(url=url, port=_port, api_key=api_key, prefer_grpc=False)
+                 logger.info(f"QdrantRetriever: Initialized client for {url}:{_port} with prefer_grpc=False")
+            else: # URL likely includes port or is a cloud URL (api_key might be used) - fallback if not cloud
+                 self.client = QdrantClient(url=url, api_key=api_key, prefer_grpc=False)
+                 logger.info(f"QdrantRetriever: Initialized client for {url} (default port) with prefer_grpc=False.")
         else:
-            # Use local Qdrant instance with persistence
-            os.makedirs("data/qdrant", exist_ok=True)
-            self.client = QdrantClient(path="data/qdrant")
-            logger.info("Using local Qdrant instance with persistence")
+            # Fallback to local Qdrant instance with persistence
+            default_qdrant_path = "data/qdrant"
+            os.makedirs(default_qdrant_path, exist_ok=True)
+            self.client = QdrantClient(path=default_qdrant_path)
+            logger.info(f"QdrantRetriever: Initialized local client at path ./{default_qdrant_path}")
     
     def create_collection(self, recreate: bool = False):
         """Create a collection in Qdrant.
@@ -114,19 +133,21 @@ class QdrantRetriever:
         logger.info(f"Loaded {len(chunks)} embedded chunks from {file_path}")
         return chunks
     
-    def upsert_chunks(self, chunks: List[Dict], batch_size: int = 100):
+    def upsert_chunks(self, chunks: List[Dict], batch_size: Optional[int] = None):
         """Insert or update chunks in Qdrant.
         
         Args:
             chunks: List of dictionaries containing chunks with embeddings
-            batch_size: Batch size for insertion
+            batch_size: Batch size for insertion (defaults to constructor's qdrant_batch_size)
         """
         total_chunks = len(chunks)
         logger.info(f"Upserting {total_chunks} chunks to Qdrant")
         
+        current_batch_size = batch_size if batch_size is not None else self.qdrant_batch_size
+
         # Process in batches
-        for i in tqdm(range(0, total_chunks, batch_size), desc="Upserting to Qdrant"):
-            batch = chunks[i:i+batch_size]
+        for i in tqdm(range(0, total_chunks, current_batch_size), desc="Upserting to Qdrant"):
+            batch = chunks[i:i+current_batch_size]
             
             # Prepare points for upsert
             points = []
@@ -189,13 +210,14 @@ class QdrantRetriever:
             
             logger.info(f"Completed ingestion for {doc_type}")
     
-    def search(self, query_vector: List[float], limit: int = 5, filter_dict: Optional[Dict] = None) -> List[Dict]:
+    def search(self, query_vector: List[float], limit: int = 5, filter_dict: Optional[Dict] = None, score_threshold: float = 0.0) -> List[Dict]:
         """Search for similar documents in Qdrant.
         
         Args:
             query_vector: Embedding vector of the query
             limit: Maximum number of results to return
             filter_dict: Optional filter for metadata fields
+            score_threshold: Minimum score threshold for results
             
         Returns:
             List of dictionaries containing search results
@@ -223,8 +245,13 @@ class QdrantRetriever:
             collection_name=self.collection_name,
             query_vector=query_vector,
             limit=limit,
-            query_filter=filter_condition
+            query_filter=filter_condition,
+            score_threshold=score_threshold
         )
+        
+        logger.info(f"QdrantRetriever.search: Found {len(search_result)} hits for vector query.")
+        if not search_result:
+            logger.warning(f"QdrantRetriever.search: No hits found for score_threshold {score_threshold}.")
         
         # Format results
         results = []

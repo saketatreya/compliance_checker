@@ -48,8 +48,8 @@ class QueryPipeline:
     
     def __init__(
         self,
-        qdrant_host: str = "localhost",
-        qdrant_port: int = 6333,
+        qdrant_url: Optional[str] = None,
+        qdrant_api_key: Optional[str] = None,
         qdrant_collection: str = "rbi_regulations",
         embedding_model_name: str = "msmarco-distilbert-base-tas-b",
         llm_model_name: str = "models/gemini-1.5-flash",
@@ -58,46 +58,48 @@ class QueryPipeline:
         """Initialize the query pipeline.
         
         Args:
-            qdrant_host: Qdrant host address
-            qdrant_port: Qdrant port
+            qdrant_url: Qdrant Cloud URL (e.g., https://your-cluster.cloud.qdrant.io). Defaults to local if not set.
+            qdrant_api_key: Qdrant API Key. Required if qdrant_url is for a secured cloud instance.
             qdrant_collection: Qdrant collection name
             embedding_model_name: Name of the embedding model to use
             llm_model_name: Name of the LLM model to use
             google_api_key: Google API key for Gemini (defaults to GOOGLE_API_KEY env var)
         """
-        self.qdrant_host = qdrant_host
-        self.qdrant_port = qdrant_port
+        self.qdrant_url = qdrant_url
+        self.qdrant_api_key = qdrant_api_key
         self.qdrant_collection = qdrant_collection
+        self.embedding_model_name = embedding_model_name # Ensure this is used for ST
         
         # Initialize Qdrant client (used for direct search)
-        self.qdrant_client = QdrantClient(host=qdrant_host, port=qdrant_port)
-        logger.info(f"Connected to Qdrant at {qdrant_host}:{qdrant_port}")
+        qdrant_conn_port = None
+        if self.qdrant_url:
+            if "cloud.qdrant.io" in self.qdrant_url and self.qdrant_url.startswith("https://"):
+                qdrant_conn_port = 6333 # Explicitly set for cloud HTTPS REST
+            self.qdrant_client = QdrantClient(
+                url=self.qdrant_url, 
+                port=qdrant_conn_port,
+                api_key=self.qdrant_api_key,
+                prefer_grpc=False 
+            )
+            logger.info(f"QueryPipeline: QdrantClient connected to {self.qdrant_url}:{qdrant_conn_port if qdrant_conn_port else 'default'}")
+        else:
+            # Fallback to local Qdrant instance
+            self.qdrant_client = QdrantClient(host="localhost", port=6333)
+            logger.info("QueryPipeline: QdrantClient connected to local Qdrant at localhost:6333 (Cloud URL not provided)")
 
-        # Initialize embedding model
-        self.embedding_model_name = embedding_model_name
-        self.embeddings = None
+        # Initialize embedding model - FORCE SentenceTransformer for now
+        self.embeddings = None  # Ensure Langchain Google Embeddings are not used
         self._st_model = None
-
-        # Try Google Embeddings first if API key is available
-        if google_api_key:
-             try:
-                 self.embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_api_key)
-                 logger.info("Using GoogleGenerativeAIEmbeddings.")
-             except Exception as e:
-                  logger.warning(f"Failed to initialize GoogleGenerativeAIEmbeddings: {e}. Falling back to SentenceTransformer.")
-                  self.embeddings = None # Ensure fallback
-
-        # Fallback or default to SentenceTransformer
-        if not self.embeddings:
-            try:
-                self._st_model = SentenceTransformer(self.embedding_model_name)
-                logger.info(f"Using SentenceTransformer '{self.embedding_model_name}' directly.")
-            except ImportError:
-                logger.error("SentenceTransformers library not found. Install it (`pip install sentence-transformers`) for embedding.")
-                raise
-            except Exception as e:
-                logger.error(f"Failed to load SentenceTransformer model '{self.embedding_model_name}': {e}")
-                raise
+        logger.info(f"QueryPipeline: Forcing use of SentenceTransformer model: '{self.embedding_model_name}'")
+        try:
+            self._st_model = SentenceTransformer(self.embedding_model_name)
+            logger.info(f"QueryPipeline: Successfully loaded SentenceTransformer '{self.embedding_model_name}'.")
+        except ImportError:
+            logger.error("SentenceTransformers library not found. Install it (`pip install sentence-transformers`) for embedding.")
+            raise
+        except Exception as e:
+            logger.error(f"QueryPipeline: Failed to load SentenceTransformer model '{self.embedding_model_name}': {e}")
+            raise
         
         # LangChain Vector Store (mainly for potential future use or other LangChain integrations)
         # We will primarily use direct Qdrant client search for retrieval with SentenceTransformer
@@ -122,8 +124,8 @@ class QueryPipeline:
              self.llm = None
              self.compliance_chain = None
         else:
-            self.llm = ChatGoogleGenerativeAI(model=llm_model_name, google_api_key=google_api_key)
-            logger.info(f"Initialized LLM: {llm_model_name}")
+            self.llm = ChatGoogleGenerativeAI(model=llm_model_name, temperature=0.1) # Add temperature
+            logger.info(f"Initialized LLM with model: {llm_model_name}")
 
             # Define prompt template
             self.compliance_prompt = PromptTemplate(
@@ -611,6 +613,44 @@ class QueryPipeline:
 
 
         return "\n\n".join(report_parts)
+
+    def _generate_compliance_analysis(self, policy_section: str, regulations: List[Dict]) -> str:
+        """Generate compliance analysis using LLM."""
+        logger.info(f"_generate_compliance_analysis: Generating analysis for policy section (first 100 chars): '{policy_section[:100]}...'")
+        logger.info(f"_generate_compliance_analysis: Number of regulations provided to LLM: {len(regulations)}")
+        if regulations:
+            for i, reg in enumerate(regulations):
+                logger.info(f"  Regulation {i+1} for LLM:")
+                logger.info(f"    Score: {reg.get('score')}")
+                logger.info(f"    Text Snippet: {reg.get('text', '')[:150]}...")
+                logger.info(f"    Metadata: {reg.get('metadata')}")
+        else:
+            logger.warning("_generate_compliance_analysis: No regulations provided to LLM. Analysis will be based on policy section only.")
+
+        # Prepare context for LLM
+        context = "Policy Section:\n" + policy_section + "\n\nRelevant RBI Regulations:\n"
+
+        # Format context for the prompt
+        context_str = ""
+        for i, reg in enumerate(regulations):
+            metadata = reg.get("metadata", {})
+            ref = metadata.get("reference_id", f"Doc {i+1}")
+            clause = metadata.get("clause_id", None)
+            page = metadata.get("page", None)
+            citation = f"[Source: {ref}" + (f", Clause {clause}" if clause else "") + (f", Page {page}" if page else "") + "]"
+            context_str += f"Regulation {i+1}: {citation}\n{reg['text']}\n\n"
+        
+        if not context_str:
+            context_str = "No relevant regulations found in the knowledge base."
+            
+        try:
+            # Run the LLM chain
+            response = self.compliance_chain.run(context=context_str, document=policy_section)
+            logger.info("LLM analysis completed.")
+            return response
+        except Exception as e:
+            logger.error(f"Error during LLM analysis: {e}")
+            return f"Error during analysis: {e}"
 
 
 def parse_args():
