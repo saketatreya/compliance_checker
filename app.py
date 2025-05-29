@@ -4,6 +4,9 @@ import tempfile
 import logging
 import os
 import re
+import pandas as pd
+import plotly.graph_objects as go
+from collections import Counter # Import Counter
 
 from src.pipeline.query_pipeline import QueryPipeline
 from src.utils.env_loader import load_environment_variables
@@ -16,8 +19,177 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "models/gemini-1.5-flash"
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_TOP_K = 5
+STATUS_COLORS = {
+    "Compliant": "green",
+    "Partially Compliant": "orange",
+    "Non-Compliant": "red",
+    "Unable to Assess": "gray"
+}
+STATUS_ICONS = {
+    "Compliant": "🟢",
+    "Partially Compliant": "🟡",
+    "Non-Compliant": "🔴",
+    "Unable to Assess": "⚪"
+}
 
-# --- Functions ---
+# --- Helper Functions ---
+
+def parse_llm_analysis(analysis_text: str, section_index: int) -> dict:
+    """Parses the LLM analysis text to extract structured data based on the new prompt format."""
+    parsed_data = {
+        "llm_section_title": f"Section {section_index+1} Analysis", # Default title
+        "compliance_status": "Unable to Assess", # Default status
+        "compliance_pct": 0,
+        "compliance_verdict": "Unable to Assess", # Default verdict
+        "action_items": [],
+        "severity_counts": {"High": 0, "Medium": 0, "Low": 0},
+        "metrics": {
+            "aspects_assessed": 0,
+            "compliant_items": 0,
+            "partially_compliant_items": 0,
+            "noncompliant_items": 0,
+            "unable_to_assess_items": 0
+        },
+        "detailed_assessment": "", # Store the detailed assessment part
+        "referenced_regulations": "", # Store the referenced regulations part
+        "raw_analysis": analysis_text # Keep raw text for reference
+    }
+
+    # 1. Extract Section Title
+    title_match = re.search(r"- Section Title: (.*?)\n", analysis_text)
+    if title_match:
+        title = title_match.group(1).strip()
+        # Basic cleaning, remove potential leading numbers/letters and trailing punctuation
+        title = re.sub(r'^[A-Za-z0-9]+\.\s*', '', title).strip()
+        title = re.sub(r'[.,;:!?]$', '', title).strip()
+        if title: # Ensure title is not empty after cleaning
+            parsed_data["llm_section_title"] = title
+
+    # 2. Extract Overall Compliance Percentage and Verdict
+    overall_match = re.search(r"- Overall Compliance: (\d+)% \((.*?)\)\n", analysis_text)
+    if overall_match:
+        parsed_data["compliance_pct"] = int(overall_match.group(1))
+        parsed_data["compliance_verdict"] = overall_match.group(2).strip()
+        # Determine status based on verdict (more reliable than just percentage now)
+        verdict = parsed_data["compliance_verdict"]
+        if verdict == "Fully Compliant":
+            parsed_data["compliance_status"] = "Compliant"
+        elif verdict == "Largely Compliant" or verdict == "Minor Issues Found":
+            parsed_data["compliance_status"] = "Partially Compliant"
+        elif verdict == "Significant Issues Found":
+            parsed_data["compliance_status"] = "Non-Compliant"
+        else: # Includes "Unable to Assess"
+            parsed_data["compliance_status"] = "Unable to Assess"
+    else:
+        # Fallback if overall line not found (shouldn't happen with new prompt)
+        if "unable to assess" in analysis_text.lower():
+            parsed_data["compliance_status"] = "Unable to Assess"
+            parsed_data["compliance_verdict"] = "Unable to Assess"
+
+    # 3. Extract Compliance Metrics (Counts)
+    metrics_patterns = {
+        "aspects_assessed": r"- Number of Policy Aspects Assessed: (\d+)",
+        "compliant_items": r"- Compliant Items: (\d+)",
+        "partially_compliant_items": r"- Partially Compliant Items: (\d+)",
+        "noncompliant_items": r"- Non-Compliant Items: (\d+)",
+        "unable_to_assess_items": r"- Items Unable to Assess: (\d+)"
+    }
+    for key, pattern in metrics_patterns.items():
+        match = re.search(pattern, analysis_text)
+        if match:
+            parsed_data["metrics"][key] = int(match.group(1))
+
+    # 4. Extract Prioritized Action Items
+    action_items_section_match = re.search(r"\*\*2\. Prioritized Action Items:\*\*\s*(.*?)(?=\n\*\*3\. Detailed Assessment|$)", analysis_text, re.DOTALL)
+    if action_items_section_match:
+        action_items_text = action_items_section_match.group(1).strip()
+        if "No action items required" not in action_items_text:
+            # Regex to capture severity, aspect, and recommendation
+            action_item_matches = re.finditer(r"\d+\. \[(High|Medium|Low) Severity\] (.*?): (.*?)(?=\n\d+\. |$)", action_items_text, re.DOTALL)
+            for match in action_item_matches:
+                severity = match.group(1).strip()
+                policy_aspect = match.group(2).strip()
+                recommendation = match.group(3).strip()
+                parsed_data["severity_counts"][severity] += 1
+                parsed_data["action_items"].append({
+                    "section_title": parsed_data["llm_section_title"], # Use processed title
+                    "severity": severity,
+                    "policy_aspect": policy_aspect,
+                    "recommendation": recommendation
+                })
+
+    # 5. Extract Detailed Assessment Section
+    detailed_assessment_match = re.search(r"\*\*3\. Detailed Assessment:\*\*\s*(.*?)(?=\n\*\*4\. Referenced Regulations|$)", analysis_text, re.DOTALL)
+    if detailed_assessment_match:
+        parsed_data["detailed_assessment"] = detailed_assessment_match.group(1).strip()
+
+    # 6. Extract Referenced Regulations Section
+    referenced_regulations_match = re.search(r"\*\*4\. Referenced Regulations:\*\*\s*(.*?)(?=\n\*\*Context|$)", analysis_text, re.DOTALL)
+    if referenced_regulations_match:
+        parsed_data["referenced_regulations"] = referenced_regulations_match.group(1).strip()
+
+    return parsed_data
+
+def calculate_overall_summary(processed_sections: list) -> dict:
+    """Calculates overall summary statistics from processed sections."""
+    summary = {
+        "total_sections": len(processed_sections),
+        "avg_compliance_pct": 0,
+        "section_status_counts": Counter(),
+        "total_item_metrics": Counter(),
+        "total_severity_counts": Counter(),
+        "all_action_items": [],
+        "non_compliant_sections": []
+    }
+
+    if not processed_sections:
+        return summary
+
+    total_pct = 0
+    for section in processed_sections:
+        # Revert to direct access - keys should be present now
+        total_pct += section["compliance_pct"]
+        summary["section_status_counts"][section["compliance_status"]] += 1
+        summary["total_item_metrics"].update(section["metrics"])
+        summary["total_severity_counts"].update(section["severity_counts"])
+        summary["all_action_items"].extend(section["action_items"])
+        if section["compliance_status"] == "Non-Compliant":
+            summary["non_compliant_sections"].append(section["section_title"])
+
+    # Add check for division by zero
+    if summary["total_sections"] > 0:
+        summary["avg_compliance_pct"] = round(total_pct / summary["total_sections"])
+    else:
+        summary["avg_compliance_pct"] = 0 # Ensure it's 0 if no sections
+
+    # Sort action items by severity
+    severity_order = {"High": 0, "Medium": 1, "Low": 2}
+    summary["all_action_items"].sort(key=lambda x: severity_order.get(x["severity"], 3))
+
+    return summary
+
+def create_compliance_donut_chart(status_counts: Counter):
+    """Creates a Plotly donut chart for compliance status breakdown."""
+    labels = list(status_counts.keys())
+    values = list(status_counts.values())
+    colors = [STATUS_COLORS.get(label, 'grey') for label in labels]
+
+    fig = go.Figure(data=[go.Pie(labels=labels,
+                                values=values,
+                                hole=.4,
+                                marker_colors=colors,
+                                textinfo='percent+label',
+                                hoverinfo='label+value+percent')])
+    fig.update_layout(
+        # title_text='Section Compliance Status',
+        showlegend=False,
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=250 # Adjust height
+    )
+    return fig
+
+# --- Streamlit App Code ---
+
 @st.cache_resource # Cache the pipeline resource across reruns
 def get_pipeline():
     """Initializes and returns the QueryPipeline instance."""
@@ -35,13 +207,14 @@ def get_pipeline():
 
 # --- App Setup ---
 st.set_page_config(
-    page_title="BankRAG Compliance Checker",
+    page_title="Compliance Checker",
     page_icon="🏦",
     layout="wide"
 )
 
-st.title("🏦 BankRAG Compliance Checker")
-st.caption("Upload an internal policy document (PDF, DOCX, TXT, HTML) to analyze its compliance against RBI regulations.")
+st.title("🏦 Compliance Checker")
+# Add Welcome Message/Instructions
+st.info("Welcome! Upload an internal policy document (PDF, DOCX, TXT, HTML) using the panel on the left. Adjust the analysis parameters in the sidebar if needed, then click 'Analyze Compliance'. The results will appear below.")
 
 # --- Session State Initialization ---
 if 'analysis_results' not in st.session_state:
@@ -50,58 +223,76 @@ if 'uploaded_file_name' not in st.session_state:
     st.session_state.uploaded_file_name = None
 if 'last_analysis_params' not in st.session_state:
     st.session_state.last_analysis_params = {}
+if 'filter_status' not in st.session_state:
+    st.session_state.filter_status = "All"
+if 'search_term' not in st.session_state:
+    st.session_state.search_term = ""
 
 # --- Sidebar for Configuration ---
 st.sidebar.header("Analysis Configuration")
 # model_choice = st.sidebar.selectbox("LLM Model", [DEFAULT_MODEL], disabled=True) # Model fixed for now
-top_k = st.sidebar.slider("Top K Regulations per Chunk", 1, 15, DEFAULT_TOP_K, 1)
-score_threshold = st.sidebar.slider("Minimum Similarity Threshold", 0.0, 1.0, DEFAULT_THRESHOLD, 0.05)
+top_k = st.sidebar.slider("Top K Regulations per Chunk", 1, 15, DEFAULT_TOP_K, 1, help="How many relevant regulations to consider for each section of the document.")
+score_threshold = st.sidebar.slider("Minimum Similarity Threshold", 0.0, 1.0, DEFAULT_THRESHOLD, 0.05, help="How closely a regulation must match a document section to be considered relevant (0.0 = loose, 1.0 = strict).")
+st.sidebar.caption("Adjust how strictly the analysis matches regulations.")
+
+# Add Reset Button to Sidebar
+st.sidebar.divider()
+if st.sidebar.button("Clear Results / Start New", key="clear_button", use_container_width=True):
+    st.session_state.analysis_results = None
+    st.session_state.uploaded_file_name = None
+    st.session_state.last_analysis_params = {}
+    st.session_state.filter_status = "All"
+    st.session_state.search_term = ""
+    st.rerun()
 
 # --- Initialize Pipeline ---
-pipeline = get_pipeline() 
+pipeline = get_pipeline()
 
 if pipeline is None:
     st.warning("Pipeline could not be initialized. Analysis is unavailable. Please check API Key and logs.")
     # Stop execution if pipeline failed
-    st.stop() 
+    st.stop()
 
-# --- Main Area --- 
+# --- Main Area ---
 col1, col2 = st.columns([1, 2]) # Define columns for layout
 
 with col1:
     st.subheader("Upload Document")
     uploaded_file = st.file_uploader(
-        "Choose a document", 
-        type=["pdf", "docx", "txt", "html"], 
-        help="Upload your internal policy document for analysis.",
+        "Choose a document",
+        type=["pdf", "docx", "txt", "html"],
+        help="Upload your internal policy document (PDF, DOCX, TXT, HTML) for compliance analysis against RBI regulations.",
         label_visibility="collapsed" # Hide label as subheader is present
     )
+    st.caption("Select the policy document you want to analyze.")
 
     analyze_button_disabled = uploaded_file is None
     analyze_button = st.button("Analyze Compliance", key="analyze_button", disabled=analyze_button_disabled, use_container_width=True)
 
     if uploaded_file is not None:
         st.info(f"Uploaded: **{uploaded_file.name}**")
-        
+
         # Store filename if it changes
         if st.session_state.uploaded_file_name != uploaded_file.name:
              st.session_state.uploaded_file_name = uploaded_file.name
              st.session_state.analysis_results = None # Clear old results on new file
              st.session_state.last_analysis_params = {}
+             st.session_state.filter_status = "All" # Reset filters on new file
+             st.session_state.search_term = ""
 
 with col2:
     st.subheader("Analysis Report")
-    
+
     # Placeholder for the progress bar
     progress_bar_placeholder = st.empty()
     progress_text_placeholder = st.empty()
 
-    # --- Run Analysis --- 
+    # --- Run Analysis ---
     if analyze_button and uploaded_file is not None:
         # Check if analysis needs to be rerun (new file or changed params)
         current_params = {"top_k": top_k, "threshold": score_threshold}
         if st.session_state.analysis_results is None or st.session_state.last_analysis_params != current_params:
-            # Save uploaded file temporarily 
+            # Save uploaded file temporarily
             with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_file.name).suffix) as tmp_file:
                 tmp_file.write(uploaded_file.getvalue())
                 tmp_file_path = tmp_file.name
@@ -112,19 +303,25 @@ with col2:
             progress_text = progress_text_placeholder.text("Starting analysis... 0%")
 
             # Define the callback function for progress updates
-            def update_progress(value): 
+            def update_progress(value):
                 # Ensure value is between 0 and 1
                 value = max(0.0, min(1.0, value))
                 percent_complete = int(value * 100)
                 progress_bar.progress(value)
-                progress_text.text(f"Analyzing document... {percent_complete}%")
+                # More specific progress text
+                if value < 0.1:
+                    progress_text.text(f"Preprocessing document... {percent_complete}%")
+                elif value < 0.8:
+                    progress_text.text(f"Analyzing sections... {percent_complete}%")
+                else:
+                    progress_text.text(f"Generating report... {percent_complete}%")
 
             try:
                 # Run the analysis with selected parameters and the callback
                 logger.info(f"Running analysis with top_k={top_k}, score_threshold={score_threshold}")
                 analysis_results = pipeline.analyze_document(
-                    tmp_file_path, 
-                    top_k=top_k, 
+                    tmp_file_path,
+                    top_k=top_k,
                     score_threshold=score_threshold,
                     progress_callback=update_progress # Pass the callback here
                 )
@@ -144,36 +341,20 @@ with col2:
                 progress_text_placeholder.empty()
             finally:
                 # Clean up the temporary file
-                if os.path.exists(tmp_file_path):
+                if 'tmp_file_path' in locals() and os.path.exists(tmp_file_path):
                     try:
                         os.remove(tmp_file_path)
                         logger.info(f"Removed temporary file: {tmp_file_path}")
                     except Exception as e_clean:
                         logger.warning(f"Could not remove temporary file {tmp_file_path}: {e_clean}")
-            
-            # Rerun script to display results after analysis finishes
-            st.rerun() 
 
-    # --- Display Results --- 
+            # Rerun script to display results after analysis finishes
+            st.rerun()
+
+    # --- Display Results ---
     if st.session_state.analysis_results is not None:
         results = st.session_state.analysis_results
-        skipped_sections_count = 0
-        total_sections = 0
-        sections_displayed = 0
-        
-        # Collection for storing summary data
-        overall_compliance_data = {
-            "total_compliance_pct": 0,
-            "policy_aspects_assessed": 0,
-            "compliant_items": 0,
-            "partially_compliant_items": 0,
-            "noncompliant_items": 0,
-            "unable_to_assess_items": 0,
-            "high_severity_items": 0,
-            "medium_severity_items": 0,
-            "low_severity_items": 0,
-            "all_action_items": []
-        }
+        processed_sections = [] # Store processed data for filtering
 
         # Check for errors stored in session state
         if isinstance(results, dict) and "error" in results:
@@ -184,310 +365,189 @@ with col2:
             # Display Overall Header
             st.header("Compliance Analysis Report")
             params = results.get('parameters', {})
-            st.caption(f"Document: `{results.get('document_path', 'N/A')}` | Top K Regulations: {params.get('top_k', 'N/A')} | Similarity Threshold: {params.get('score_threshold', 'N/A')}")
-            
-            # Iterate through sections and collect summary data first
+            doc_name = st.session_state.uploaded_file_name or results.get('document_path', 'N/A')
+            st.caption(f"Document: `{doc_name}` | Top K Regulations: {params.get('top_k', 'N/A')} | Similarity Threshold: {params.get('score_threshold', 'N/A')}")
+
+            # --- Process Sections --- 
             section_analyses = results.get("section_analyses", [])
             total_sections = len(section_analyses)
-            
+
             for i, section_data in enumerate(section_analyses):
-                section_title = section_data.get("section_title", f"Section {i+1}")
                 analysis_text = section_data.get("analysis_text", "Analysis not available.")
-                
-                # Extract LLM-identified section title
-                llm_section_title_match = re.search(r"- Section Title: \[(.*?)\]", analysis_text)
-                if llm_section_title_match:
-                    llm_section_title = llm_section_title_match.group(1).strip()
-                    
-                    # Post-process the section title to clean up any formatting issues
-                    # 1. Remove any section numbers or letters at the beginning (A., 1., etc.)
-                    llm_section_title = re.sub(r'^[A-Za-z0-9]+\.\s*', '', llm_section_title)
-                    
-                    # 2. If title is too long (more than 50 chars), it's likely a sentence - truncate and add ellipsis
-                    if len(llm_section_title) > 50:
-                        # Try to find a natural breaking point (after 4-5 words)
-                        words = llm_section_title.split()
-                        if len(words) > 5:
-                            llm_section_title = ' '.join(words[:5])
-                        else:
-                            llm_section_title = llm_section_title[:50]
-                    
-                    # 3. Convert to title case
-                    llm_section_title = llm_section_title.title()
-                    
-                    # 4. If it ends with a period or other punctuation, remove it
-                    llm_section_title = re.sub(r'[.,;:!?]$', '', llm_section_title)
-                    
-                    # 5. Extract the main topic using NLP-like heuristics
-                    # If it contains "shall", "must", "will", it's likely a policy statement, not a title
-                    # Extract just the subject and object
-                    policy_verbs = ['shall', 'must', 'will', 'should', 'may', 'can', 'report', 'identify', 'verify']
-                    for verb in policy_verbs:
-                        if verb in llm_section_title.lower():
-                            # Find what the policy is about by looking at key nouns around the verb
-                            parts = llm_section_title.lower().split(verb)
-                            if len(parts) > 1:
-                                # Look for banking terms in the statement
-                                key_terms = ['transaction', 'customer', 'account', 'risk', 'report', 
-                                            'currency', 'kyc', 'aml', 'verification', 'due diligence',
-                                            'monitoring', 'identification', 'document', 'policy', 'procedure',
-                                            'compliance', 'suspicious', 'counterfeit', 'activity']
-                                
-                                found_terms = []
-                                for term in key_terms:
-                                    if term in llm_section_title.lower():
-                                        found_terms.append(term.title())
-                                
-                                if found_terms:
-                                    if len(found_terms) > 2:
-                                        found_terms = found_terms[:2]  # Limit to 2 terms
-                                    llm_section_title = " ".join(found_terms) + " Requirements"
-                                    break
-                                else:
-                                    # Generic fallback - grab some context words
-                                    context_nouns = parts[1].strip().split()[:2]
-                                    if context_nouns:
-                                        llm_section_title = " ".join([word.title() for word in context_nouns]) + " Policy"
-                                    else:
-                                        llm_section_title = "Policy Requirements"
-                                    break
-                    
-                    # Store the processed title
-                    section_data["llm_section_title"] = llm_section_title
-                
-                # Extract compliance percentage from LLM response using regex
-                compliance_pct_match = re.search(r"Overall Compliance: (\d+)%", analysis_text)
-                compliance_pct = int(compliance_pct_match.group(1)) if compliance_pct_match else 0
-                
-                # Extract compliance metrics using regex
-                aspects_assessed_match = re.search(r"Number of Policy Aspects Assessed: (\d+)", analysis_text)
-                compliant_items_match = re.search(r"Compliant Items: (\d+) \((\d+)%\)", analysis_text)
-                partially_compliant_match = re.search(r"Partially Compliant Items: (\d+) \((\d+)%\)", analysis_text)
-                noncompliant_match = re.search(r"Non-Compliant Items: (\d+) \((\d+)%\)", analysis_text)
-                unable_to_assess_match = re.search(r"Items Unable to Assess: (\d+)", analysis_text)
-                
-                # Extract action items
-                action_items_section = re.search(r"\*\*2\. Prioritized Action Items:\*\*\s*(.*?)(?=\*\*3\. Detailed Assessment)", analysis_text, re.DOTALL)
-                
-                if action_items_section:
-                    action_items_text = action_items_section.group(1).strip()
-                    
-                    # If there are action items, extract them with severity
-                    if "No action items required" not in action_items_text:
-                        # Look for the numbered items with severity
-                        action_item_matches = re.finditer(r"(\d+)\. \[(High|Medium|Low) Severity\] ([^:]+): ([^\n]+)", action_items_text)
-                        
-                        for match in action_item_matches:
-                            severity = match.group(2)
-                            policy_aspect = match.group(3).strip()
-                            recommendation = match.group(4).strip()
-                            
-                            # Track severities
-                            if severity == "High":
-                                overall_compliance_data["high_severity_items"] += 1
-                            elif severity == "Medium":
-                                overall_compliance_data["medium_severity_items"] += 1
-                            elif severity == "Low":
-                                overall_compliance_data["low_severity_items"] += 1
-                                
-                            # Store action item with section data
-                            overall_compliance_data["all_action_items"].append({
-                                "section_title": section_title,
-                                "severity": severity,
-                                "policy_aspect": policy_aspect,
-                                "recommendation": recommendation
-                            })
-                
-                # Aggregate the compliance data
-                if compliance_pct > 0:
-                    overall_compliance_data["total_compliance_pct"] += compliance_pct
-                
-                if aspects_assessed_match:
-                    overall_compliance_data["policy_aspects_assessed"] += int(aspects_assessed_match.group(1))
-                
-                if compliant_items_match:
-                    overall_compliance_data["compliant_items"] += int(compliant_items_match.group(1))
-                
-                if partially_compliant_match:
-                    overall_compliance_data["partially_compliant_items"] += int(partially_compliant_match.group(1))
-                
-                if noncompliant_match:
-                    overall_compliance_data["noncompliant_items"] += int(noncompliant_match.group(1))
-                
-                if unable_to_assess_match:
-                    overall_compliance_data["unable_to_assess_items"] += int(unable_to_assess_match.group(1))
-                
-                # Check if section should be skipped (updating criteria for new format)
-                is_fully_compliant = compliance_pct == 100 if compliance_pct_match else False
-                no_action_items = "No action items required" in analysis_text if action_items_section else False
-                
-                if is_fully_compliant and no_action_items:
-                    skipped_sections_count += 1
-                else:
-                    sections_displayed += 1
-            
-            # Calculate overall average compliance percentage
-            if total_sections > 0:
-                overall_compliance_data["total_compliance_pct"] = round(overall_compliance_data["total_compliance_pct"] / total_sections)
-            
-            # --- Display Compliance Dashboard ---
+                parsed_analysis = parse_llm_analysis(analysis_text, i)
+
+                processed_sections.append({
+                    "original_index": i,
+                    "section_title": parsed_analysis["llm_section_title"],
+                    "compliance_status": parsed_analysis["compliance_status"],
+                    "compliance_pct": parsed_analysis["compliance_pct"],
+                    "compliance_verdict": parsed_analysis["compliance_verdict"],
+                    "analysis_text": parsed_analysis["raw_analysis"], # Store raw for display
+                    "section_text": section_data.get("section_text", ""), # Use correct key 'section_text'
+                    "referenced_regulations": parsed_analysis["referenced_regulations"], # Correct source and add key
+                    "detailed_assessment": parsed_analysis["detailed_assessment"], # Add missing key
+                    "action_items": parsed_analysis["action_items"],
+                    "metrics": parsed_analysis["metrics"],
+                    "severity_counts": parsed_analysis["severity_counts"]
+                })
+
+            # --- Calculate Overall Summary --- 
+            summary_data = calculate_overall_summary(processed_sections)
+
+            # --- Display Compliance Dashboard --- 
             st.subheader("Compliance Dashboard")
-            
-            # Create dashboard columns
-            col1, col2 = st.columns([1, 3])
-            
-            with col1:
-                # Show compliance gauge with color coding
-                compliance_pct = overall_compliance_data["total_compliance_pct"]
-                gauge_color = "#ff0000"  # Red for low compliance
-                if compliance_pct >= 80:
-                    gauge_color = "#00ff00"  # Green for high compliance
-                elif compliance_pct >= 50:
-                    gauge_color = "#ffff00"  # Yellow for medium compliance
-                
-                # Using a progress bar as a simple gauge
-                st.metric("Overall Compliance", f"{compliance_pct}%")
-                st.progress(compliance_pct/100)
-                
-                # Display counts
-                st.markdown("### Compliance Breakdown")
-                st.markdown(f"🟢 **Compliant Items:** {overall_compliance_data['compliant_items']}")
-                st.markdown(f"🟡 **Partially Compliant:** {overall_compliance_data['partially_compliant_items']}")
-                st.markdown(f"🔴 **Non-Compliant:** {overall_compliance_data['noncompliant_items']}")
-                st.markdown(f"⚪ **Unable to Assess:** {overall_compliance_data['unable_to_assess_items']}")
-            
-            with col2:
-                # Display prioritized action items
-                st.markdown("### Prioritized Action Items")
-                
-                if not overall_compliance_data["all_action_items"]:
-                    st.success("No action items required - policy is fully compliant with available regulations.")
+
+            # Key Findings Summary (Non-Compliant Sections)
+            if summary_data["non_compliant_sections"]:
+                st.error(f"**Key Findings:** {len(summary_data['non_compliant_sections'])} section(s) identified as **Non-Compliant**:\n" +
+                         "\n".join([f"- {title}" for title in summary_data['non_compliant_sections'][:5]]) +
+                         ("\n- ... (see details below)" if len(summary_data['non_compliant_sections']) > 5 else ""))
+
+            dash_col1, dash_col2, dash_col3 = st.columns([1, 1, 1]) # Use 3 columns for dashboard
+
+            with dash_col1:
+                st.metric("Overall Compliance Score", f"{summary_data['avg_compliance_pct']}%", delta=None) # No delta needed here
+                st.progress(summary_data['avg_compliance_pct'] / 100)
+
+                st.metric("Total Sections Analyzed", summary_data['total_sections'])
+
+            with dash_col2:
+                st.markdown("**Section Status Breakdown**")
+                if summary_data["section_status_counts"]:
+                    fig = create_compliance_donut_chart(summary_data["section_status_counts"])
+                    st.plotly_chart(fig, use_container_width=True)
                 else:
-                    # Sort action items by severity (High, Medium, Low)
-                    severity_order = {"High": 0, "Medium": 1, "Low": 2}
-                    sorted_actions = sorted(
-                        overall_compliance_data["all_action_items"], 
-                        key=lambda x: severity_order.get(x["severity"], 3)
-                    )
-                    
-                    # Create table of action items
-                    for i, action in enumerate(sorted_actions):
-                        severity_color = {
-                            "High": "🔴",
-                            "Medium": "🟠",
-                            "Low": "🟡"
-                        }.get(action["severity"], "⚪")
-                        
-                        st.markdown(f"{i+1}. {severity_color} **[{action['severity']}]** {action['policy_aspect']}")
-                        st.markdown(f"   *{action['recommendation']}*")
-                        st.markdown(f"   *Section: {action['section_title']}*")
-                        if i < len(sorted_actions) - 1:
-                            st.markdown("---")
-            
-            st.divider()
-            
-            # --- Display Section Details with Tabs ---
-            st.subheader("Section Analysis Details")
-            
-            if sections_displayed == 0:
-                if skipped_sections_count == total_sections and total_sections > 0:
-                    st.success("**All sections were found to be fully compliant with the retrieved regulations, and no specific recommendations were necessary based on the provided context.**")
-                else:
-                    st.warning("Analysis completed, but no sections required detailed reporting based on the criteria.")
+                    st.caption("No section data for chart.")
+
+            with dash_col3:
+                st.markdown("**Action Item Severity**")
+                # Use metrics for severity counts with color
+                st.metric("🔴 High Severity Items", summary_data['total_severity_counts']['High'])
+                st.metric("🟠 Medium Severity Items", summary_data['total_severity_counts']['Medium'])
+                st.metric("🟡 Low Severity Items", summary_data['total_severity_counts']['Low'])
+                # Highlight Non-Compliant count in red
+                non_compliant_count = summary_data['section_status_counts']['Non-Compliant']
+                st.metric("🔴 Non-Compliant Sections", non_compliant_count)
+
+            # Display Prioritized Action Items (moved below dashboard columns)
+            st.markdown("**Prioritized Action Items (Top 5)**")
+            if not summary_data["all_action_items"]:
+                 st.success("✅ No action items required based on this assessment.")
             else:
-                # Create tabs for each section to be displayed
-                displayed_sections = [section_data for i, section_data in enumerate(section_analyses) 
-                                     if not (
-                                         re.search(r"Overall Compliance: 100%", section_data.get("analysis_text", "")) and 
-                                         "No action items required" in section_data.get("analysis_text", "")
-                                     )]
-                
-                # Create tab labels
-                tab_labels = [f"Section {i+1}: {s.get('llm_section_title', s.get('section_title', 'Unnamed'))[:20]}..." 
-                             for i, s in enumerate(displayed_sections)]
-                
-                # If we have sections to display, create tabs
-                if tab_labels:
-                    tabs = st.tabs(tab_labels)
-                    
-                    # Fill content for each tab
-                    for i, (tab, section_data) in enumerate(zip(tabs, displayed_sections)):
-                        with tab:
-                            section_title = section_data.get("llm_section_title", section_data.get("section_title", f"Unnamed Section {i+1}"))
-                            analysis_text = section_data.get("analysis_text", "Analysis not available.")
-                            retrieved_regs = section_data.get("retrieved_regulations", [])
-                            section_text = section_data.get("section_text", "")
-                            section_text_preview = section_text[:500]  # Show more preview
-                            
-                            st.markdown(f"### {section_title}")
-                            
-                            with st.expander("Original Policy Text (Preview)"):
-                                st.text_area("", section_text_preview + ("..." if len(section_text) > 500 else ""), 
-                                            height=150, disabled=True, label_visibility="collapsed", 
-                                            key=f"text_exp_{i}")
-                            
-                            if retrieved_regs:
-                                with st.expander("Retrieved Regulations"):
-                                    reg_list_items = []
-                                    for reg in retrieved_regs:
-                                        metadata = reg.get('metadata', {})
-                                        source_name = metadata.get('file_name') or \
-                                                    metadata.get('document_name') or \
-                                                    metadata.get('reference_id') or \
-                                                    metadata.get('source', 'Unknown Source')
-                                        page_num = metadata.get('page_number', 'N/A')
-                                        text_preview = reg.get('text', '')[:300]
-                                        reg_list_items.append(f"- **[{source_name}, Page {page_num}]**: `{text_preview}...`")
-                                    
-                                    reg_markdown = "\n".join(reg_list_items)
-                                    st.markdown(reg_markdown, unsafe_allow_html=True)
-                            
-                            # Split analysis into tabs for the different sections
-                            analysis_tabs = st.tabs(["Compliance Summary", "Detailed Assessment", 
-                                                    "Areas of Uncertainty", "Recommendations"])
-                            
-                            # Extract sections from analysis_text
-                            summary_match = re.search(r"\*\*1\. Compliance Summary:\*\*(.*?)(?=\*\*2\. Prioritized Action Items)", 
-                                                    analysis_text, re.DOTALL)
-                            action_items_match = re.search(r"\*\*2\. Prioritized Action Items:\*\*(.*?)(?=\*\*3\. Detailed Assessment)", 
-                                                        analysis_text, re.DOTALL)
-                            detailed_match = re.search(r"\*\*3\. Detailed Assessment:\*\*(.*?)(?=\*\*4\. Areas of Uncertainty)", 
-                                                    analysis_text, re.DOTALL)
-                            uncertainty_match = re.search(r"\*\*4\. Areas of Uncertainty:\*\*(.*?)(?=\*\*5\. Actionable Recommendations)", 
-                                                        analysis_text, re.DOTALL)
-                            recommendations_match = re.search(r"\*\*5\. Actionable Recommendations:\*\*(.*)", 
-                                                            analysis_text, re.DOTALL)
-                            
-                            # Put content in each tab
-                            with analysis_tabs[0]:  # Compliance Summary
-                                if summary_match:
-                                    st.markdown("**Compliance Summary:**" + summary_match.group(1))
-                                    
-                                    if action_items_match:
-                                        st.markdown("**Prioritized Action Items:**" + action_items_match.group(1))
-                                else:
-                                    st.markdown(analysis_text)  # Fallback to full text
-                            
-                            with analysis_tabs[1]:  # Detailed Assessment
-                                if detailed_match:
-                                    st.markdown("**Detailed Assessment:**" + detailed_match.group(1))
-                                else:
-                                    st.markdown(analysis_text)  # Fallback
-                            
-                            with analysis_tabs[2]:  # Areas of Uncertainty
-                                if uncertainty_match:
-                                    st.markdown("**Areas of Uncertainty:**" + uncertainty_match.group(1))
-                                else:
-                                    st.markdown(analysis_text)  # Fallback
-                            
-                            with analysis_tabs[3]:  # Recommendations
-                                if recommendations_match:
-                                    st.markdown("**Actionable Recommendations:**" + recommendations_match.group(1))
-                                else:
-                                    st.markdown(analysis_text)  # Fallback
-                
-                # Display summary message about skipped sections
-                if skipped_sections_count > 0:
-                    st.info(f"*Note: {skipped_sections_count} section(s) were omitted from this report as they were fully compliant with no recommendations.*")
-                elif total_sections == 0:
-                    st.warning("Analysis completed, but no sections were found or analyzed in the document.")
+                actions_to_show = summary_data["all_action_items"][:5]
+                for i, action in enumerate(actions_to_show):
+                    severity_icon = {"High": "🔴", "Medium": "🟠", "Low": "🟡"}.get(action["severity"], "⚪")
+                    st.markdown(f"{i+1}. {severity_icon} **[{action['severity']}]** {action['policy_aspect']} (Section: *{action['section_title']}*)")
+                    st.markdown(f"   ↳ Recommendation: *{action['recommendation']}*")
+                    # Removed the divider between items for cleaner look
+                if len(summary_data["all_action_items"]) > len(actions_to_show):
+                    st.caption(f"... and {len(summary_data['all_action_items']) - len(actions_to_show)} more action items in the detailed sections below.")
+
+            st.divider()
+
+            # --- Filtering and Search for Detailed Results ---
+            st.subheader("Section Analysis Details")
+
+            filter_col1, filter_col2 = st.columns([1, 2])
+            with filter_col1:
+                filter_status = st.selectbox(
+                    "Filter by Compliance Status",
+                    options=["All", "Compliant", "Partially Compliant", "Non-Compliant", "Unable to Assess"],
+                    key='filter_status',
+                    help="Show only sections with the selected compliance status."
+                )
+            with filter_col2:
+                search_term = st.text_input(
+                    "Search Section Titles",
+                    key='search_term',
+                    placeholder="Enter keywords to search section titles...",
+                    help="Filter sections by keywords in their title."
+                ).lower()
+
+            # Status Legend
+            st.markdown(
+                "**Legend:** <span style='color:green;'>🟢 Compliant</span> | <span style='color:orange;'>🟡 Partially Compliant</span> | <span style='color:red;'>🔴 Non-Compliant</span> | ⚪ Unable to Assess",
+                unsafe_allow_html=True
+            )
+
+            # Filter the processed sections
+            filtered_sections = []
+            for section in processed_sections:
+                status_match = (filter_status == "All" or section["compliance_status"] == filter_status)
+                search_match = (search_term == "" or search_term in section["section_title"].lower())
+                if status_match and search_match:
+                    filtered_sections.append(section)
+
+            # --- Display Filtered Section Details ---
+            if not filtered_sections:
+                st.warning(f"No sections match the current filter criteria (Status: {filter_status}, Search: '{search_term}').")
+            else:
+                st.caption(f"Displaying {len(filtered_sections)} of {total_sections} sections.")
+                for section in filtered_sections:
+                    # Revert to direct access for title - keys should be present
+                    status_icon = STATUS_ICONS.get(section["compliance_status"], "⚪")
+                    expander_title = f"{status_icon} {section['compliance_status']} ({section['compliance_verdict']}): {section['section_title']} ({section['compliance_pct']}% Compliance)"
+                    # Keep unique key based on index, but rename for clarity
+                    policy_text_key = f"policy_text_{section['original_index']}" 
+
+                    with st.expander(expander_title):
+                        # Use columns for better layout inside expander
+                        col1, col2 = st.columns(2)
+
+                        with col1:
+                            st.markdown("**1. Policy Section Text:**")
+                            # Use the correct key 'section_text' here
+                            st.text_area("Policy Text", section.get('section_text', "Policy text not available."), height=200, disabled=True, label_visibility="collapsed", key=policy_text_key) 
+
+                        with col2:
+                            st.markdown("**2. AI Compliance Summary:**")
+                            # Revert to direct access - keys should be present
+                            st.markdown(f"""
+                            - **Overall Compliance:** {section['compliance_pct']}% ({section['compliance_verdict']})
+                            - **Compliant Items:** {section['metrics']['compliant_items']}
+                            - **Partially Compliant Items:** {section['metrics']['partially_compliant_items']}
+                            - **Non-Compliant Items:** {section['metrics']['noncompliant_items']}
+                            - **Unable to Assess:** {section['metrics']['unable_to_assess_items']}
+                            """)
+
+                            # Display Action Items for this section, revert to direct access
+                            if section['action_items']:
+                                st.markdown("**Action Items:**")
+                                for item in section['action_items']:
+                                    # Direct access within loop - item dict structure assumed consistent
+                                    sev_icon = {"High": "🔴", "Medium": "🟠", "Low": "🟡"}.get(item["severity"], "⚪")
+                                    st.markdown(f" - {sev_icon} **[{item['severity']}]** {item['policy_aspect']}: *{item['recommendation']}*")
+                            else:
+                                st.markdown("**Action Items:** None")
+
+                        st.markdown("---") # Divider below columns
+
+                        # Display Detailed Assessment and Regulations below columns
+                        st.markdown("**3. Detailed Assessment:**")
+                        # Revert to direct access - key should be present
+                        if section['detailed_assessment']:
+                            # Use markdown for better formatting of the detailed assessment
+                            st.markdown(section['detailed_assessment'])
+                        else:
+                            st.caption("Detailed assessment breakdown not available.")
+
+                        st.markdown("---")
+
+                        st.markdown("**4. Referenced Regulations:**")
+                        # Revert to direct access - key should be present
+                        if section['referenced_regulations'] and 'No specific regulations' not in section['referenced_regulations']:
+                             # Use markdown for better formatting of regulations list
+                            st.markdown(section['referenced_regulations'])
+                        else:
+                            st.markdown("*No specific regulations were found highly relevant to this section based on the current threshold or LLM output.*")
+
+                        # Optionally show raw LLM output for debugging
+                        # with st.popover("Show Raw LLM Output"):
+                        #    st.text_area("Raw LLM Analysis", section['raw_analysis'], height=200, disabled=True)
+
+    elif st.session_state.uploaded_file_name:
+        # If a file was uploaded but no results yet (e.g., after clearing)
+        st.info(f"Ready to analyze **{st.session_state.uploaded_file_name}**. Click 'Analyze Compliance' on the left.")
+    else:
+        # Initial state before any upload
+        st.info("Upload a document using the panel on the left to begin the compliance analysis.")

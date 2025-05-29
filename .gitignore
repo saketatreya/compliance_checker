@@ -20,14 +20,18 @@ parts/
 sdist/
 var/
 wheels/
+pip-wheel-metadata/
+share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
 MANIFEST
 
 # PyInstaller
-# *.manifest
-# *.spec
+#  Usually these files are written by a CI server
+#  and aren't committed to GCS.
+*.manifest
+*.spec
 
 # Installer logs
 pip-log.txt
@@ -71,31 +75,66 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# PEP 582; __pypackages__ directory
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
 # Environments
 .env
 .venv
+env/
 venv/
 ENV/
-env/
-ENV/
+env.bak/
+venv.bak/
 
-# IDEs and editors
-.idea/
-.vscode/
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
+# Spyder project settings
+.spyderproject
+.spyderworkspace
 
-# Miscellaneous
-*.lock
-*.DS_Store
+# RStudio project settings
+.Rproj.user/
 
-# Project Specific
-data/ # Exclude all data folders (raw, processed, embeddings, qdrant)
-qdrant_storage/ # Exclude docker volume mount point
+# Visual Studio Code settings
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Local Data (IMPORTANT FOR THIS PROJECT)
+data/raw/*
+data/processed/*
+data/embeddings/*
+# Keep the data/ directory structure, but ignore its contents if they are large
+# Or, if you have small sample data you want to commit for testing, adjust accordingly.
+# For this project, we expect Qdrant to be the source of truth for the deployed app.
+
+# Qdrant local storage
+qdrant_storage/
+
+# macOS
+.DS_Store
 
 # Logs
 logs/
-*.log 
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Docker
+docker-compose.override.yml 

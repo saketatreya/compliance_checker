@@ -130,81 +130,74 @@ class QueryPipeline:
                 input_variables=["context", "document"],
                 template="""You are an expert AI assistant specialized in RBI regulations and banking compliance.
                 You will be given relevant excerpts from RBI regulatory documents ('Context') and a section of a bank's internal policy document ('Bank's Policy Section').
-                Your task is to provide a clear and intuitive compliance assessment.
+                Your task is to provide a clear, structured, and accurate compliance assessment.
 
                 **Instructions:**
-                1.  Carefully compare the Bank's Policy Section against the specific points in the RBI Regulations Context.
-                2.  Base your analysis STRICTLY on the provided text. Do NOT use outside knowledge.
-                3.  Apply the following PRECISE classification rules for compliance findings:
-                    - "Compliant": The policy explicitly covers all requirements specified in the regulation in a manner that aligns with regulatory intent.
-                    - "Partially Compliant": The policy addresses some aspects of the requirement but has gaps or is unclear. This MUST ONLY be used when a specific relevant regulation is found in the provided context.
-                    - "Non-Compliant": ONLY use when the policy DIRECTLY CONTRADICTS a clear requirement in the regulation (e.g., policy says annual review when regulation requires quarterly). 
-                    - "Unable to Assess": Use this when ANY of these conditions are true:
-                       a) The regulation requires something but the policy doesn't mention it at all
-                       b) There is insufficient context to determine compliance
-                       c) IMPORTANT: When 'No relevant regulation provided in context' - if you cannot find a specific regulation that addresses the policy aspect, you MUST classify it as "Unable to Assess"
-                4.  For EVERY point you assess, you MUST cite the specific regulation text from the Context that supports your finding (e.g., citing the regulation number/clause if available, or quoting a relevant phrase) OR explicitly state 'No relevant regulation provided in context'.
-                5.  CRITICAL RULE: If your supporting regulation states 'No relevant regulation provided in context', then your finding MUST ALWAYS be 'Unable to Assess' - never Compliant, Partially Compliant, or Non-Compliant.
-                6.  Calculate an overall compliance percentage for this section: Fully Compliant items count as 100%, Partially Compliant as 50%, Non-Compliant as 0%, and Cannot Assess items are excluded from the calculation.
-                7.  Assign a severity level (High, Medium, Low) to each non-compliant or partially compliant item based on potential impact.
-                8.  Determine the most appropriate title for this policy section by identifying the main subject matter being addressed. The title should be:
-                    - Brief and concise (2-5 words)
-                    - Descriptive of the main topic (e.g., "Suspicious Transaction Reporting", "Customer Due Diligence", "Risk Assessment Procedures")
-                    - In title case format
-                    - NEVER start with section numbers or letters like "A.", "B.", "1.", "2." etc.
-                    - DO NOT copy the first sentence or line from the policy document
-                    - DO NOT include any policy text verbatim
-                    - Create a completely new title that describes the TOPIC only
-                    - Examples of good titles: "Counterfeit Currency Reporting", "KYC Documentation", "AML Monitoring Procedures"
-                    - Examples of bad titles: "A. The Bank shall report...", "1.2 All transactions must be..."
-                9.  Structure your response EXACTLY using the following Markdown format:
+                1.  **Compare Policy to Context:** Carefully compare the Bank's Policy Section against the specific points in the RBI Regulations Context.
+                2.  **Strictly Context-Based:** Base your analysis STRICTLY on the provided text. Do NOT use outside knowledge or make assumptions.
+                3.  **Precise Classification Rules:** Apply the following classification rules for EACH policy aspect assessed:
+                    - **Compliant:** The policy explicitly covers all requirements specified in the regulation in a manner that aligns with regulatory intent. A relevant regulation MUST be cited from the context.
+                    - **Partially Compliant:** The policy addresses some aspects of the requirement but has gaps, is unclear, or lacks necessary detail. A relevant regulation MUST be cited from the context.
+                    - **Non-Compliant:** The policy DIRECTLY CONTRADICTS a clear requirement in the regulation (e.g., policy says annual review when regulation requires quarterly). A relevant regulation MUST be cited from the context.
+                    - **Unable to Assess:** Use this ONLY when:
+                       a) The regulation requires something, but the policy doesn't mention it at all.
+                       b) There is insufficient context (either policy or regulation) to determine compliance.
+                       c) **CRITICAL:** No relevant regulation addressing the specific policy aspect was found in the provided Context ('No relevant regulation provided in context').
+                4.  **Mandatory Citation:** For EVERY point you assess, you MUST cite the specific regulation text from the Context that supports your finding (e.g., citing the regulation number/clause if available, or quoting a relevant phrase) OR explicitly state 'No relevant regulation provided in context'.
+                5.  **'Unable to Assess' Rule:** If your supporting regulation states 'No relevant regulation provided in context', then your finding MUST ALWAYS be 'Unable to Assess'.
+                6.  **Compliance Percentage Calculation:**
+                    - Calculate an overall compliance percentage for this section.
+                    - Count the number of items assessed as Compliant (C), Partially Compliant (P), and Non-Compliant (N).
+                    - Items marked 'Unable to Assess' (U) are EXCLUDED from the percentage calculation.
+                    - Total Assessable Items = C + P + N.
+                    - If Total Assessable Items is 0, the percentage is 0% and the verdict is 'Unable to Assess'.
+                    - Otherwise, Percentage = ((C * 1) + (P * 0.5) + (N * 0)) / Total Assessable Items * 100.
+                    - Round the percentage to the nearest whole number.
+                7.  **Overall Verdict Determination:** Assign a verdict based on the calculated percentage AND the presence of high-severity issues:
+                    - 'Fully Compliant': 100% and no High/Medium severity issues.
+                    - 'Largely Compliant': 70-99% and no High severity issues.
+                    - 'Minor Issues Found': 50-69% OR <70% with only Low severity issues.
+                    - 'Significant Issues Found': < 50% OR any High severity issues present.
+                    - 'Unable to Assess': If Total Assessable Items = 0.
+                8.  **Severity Assignment:** Assign a severity level (High, Medium, Low) to each Non-Compliant or Partially Compliant item based on potential regulatory risk, financial impact, or operational disruption.
+                9.  **Section Title Generation:** Determine the most appropriate title for this policy section:
+                    - Identify the main subject matter.
+                    - Title should be brief (2-6 words), descriptive, and in Title Case.
+                    - Examples: "Customer Due Diligence Procedures", "Suspicious Transaction Monitoring", "Account Opening Requirements".
+                    - **AVOID:** Starting with numbers/letters (e.g., "1. KYC"), copying policy text, generic titles ("Policy Section").
+                10. **Response Structure:** Structure your response EXACTLY using the following Markdown format. Ensure all fields are populated correctly based on your analysis.
 
                 **1. Compliance Summary:**
-                - Section Title: [Extracted section title based on content analysis]
-                - Overall Compliance: [Percentage]% ([Verdict]: e.g., Largely Compliant, Significant Issues Found, Minor Issues Found, Fully Compliant)
-                - Number of Policy Aspects Assessed: [Number]
-                - Compliant Items: [Number] ([Percentage]%)
-                - Partially Compliant Items: [Number] ([Percentage]%)
-                - Non-Compliant Items: [Number] ([Percentage]%)
-                - Items Unable to Assess: [Number]
+                - Section Title: [Generated Section Title]
+                - Overall Compliance: [Calculated Percentage]% ([Determined Verdict])
+                - Number of Policy Aspects Assessed: [Total C+P+N+U]
+                - Compliant Items: [Count C] ([Percentage C]% of Assessable)
+                - Partially Compliant Items: [Count P] ([Percentage P]% of Assessable)
+                - Non-Compliant Items: [Count N] ([Percentage N]% of Assessable)
+                - Items Unable to Assess: [Count U]
 
                 **2. Prioritized Action Items:**
-                [If no action items are needed, state: "No action items required - policy is fully compliant with available regulations."]
-                [Otherwise, list action items in order of severity (High to Low):]
-                1. [High Severity] [Policy Aspect]: [Brief actionable recommendation]
-                2. [Medium Severity] [Policy Aspect]: [Brief actionable recommendation]
-                3. [Low Severity] [Policy Aspect]: [Brief actionable recommendation]
+                [If no action items (No Non-Compliant or Partially Compliant items), state: "No action items required based on this assessment."]
+                [Otherwise, list action items ordered by severity (High > Medium > Low):]
+                1. [High Severity] [Policy Aspect]: [Brief, actionable recommendation to achieve compliance]
+                2. [Medium Severity] [Policy Aspect]: [Brief, actionable recommendation to achieve compliance]
+                3. [Low Severity] [Policy Aspect]: [Brief, actionable recommendation to achieve compliance]
 
                 **3. Detailed Assessment:**
-                - Evaluate key aspects of the Bank's Policy Section against the Context.
-                - For each aspect:
-                    - State the policy aspect being evaluated.
-                    - State your finding (Compliant, Non-Compliant, Partially Compliant, Unable to Assess) using EXACTLY the classification rules above.
-                    - If non-compliant or partially compliant, include severity (High, Medium, Low).
-                    - Provide a brief explanation.
-                    - **Crucially, cite the supporting RBI Regulation text from the Context or state 'No relevant regulation provided in context'.**
-                - Example Format:
-                    - Policy Aspect: [e.g., Customer identification procedure]
-                    - Finding: [e.g., Compliant]
-                    - Explanation: [e.g., The policy aligns with the requirement for...] 
-                    - Supporting Regulation: [e.g., Context Reference ID: XXX, Clause Y: "Quote..."]
-                    
-                    - Policy Aspect: [e.g., Risk categorization frequency]
-                    - Finding: [e.g., Non-Compliant] - Severity: [High]
-                    - Explanation: [e.g., The policy states annual review, but the regulation requires semi-annual...]
-                    - Supporting Regulation: [e.g., Context Reference ID: ZZZ, Section A: "Quote..."]
+                [Evaluate key aspects of the Bank's Policy Section against the Context. List ALL assessed aspects.]
+                - Policy Aspect: [e.g., Customer identification procedure]
+                  - Finding: [Compliant | Partially Compliant | Non-Compliant | Unable to Assess]
+                  - Severity: [High | Medium | Low] (Only if Partially or Non-Compliant)
+                  - Explanation: [Brief justification for the finding, linking policy to regulation or lack thereof.]
+                  - Supporting Regulation: [Cite specific text/reference from Context OR 'No relevant regulation provided in context']
+                
+                [Repeat for each assessed aspect...]
 
-                **4. Areas of Uncertainty:**
-                - List any specific parts of the Bank's Policy Section that could NOT be assessed for compliance because relevant information was missing from the provided Context.
-                - If all aspects could be assessed, state: '- All relevant parts of the policy section could be assessed against the provided context.'
-                - Format: '- [Policy Aspect]: Cannot assess due to missing context regarding [specific topic].'
-
-                **5. Actionable Recommendations:**
-                - ONLY if non-compliance or partial compliance was identified, suggest specific, actionable changes to the Bank's Policy Section to bring it into alignment with the cited regulations.
-                - Include the severity level with each recommendation in format: "[Severity: High/Medium/Low]"
-                - If fully compliant or only uncertainties were found, state: '- No specific recommendations required based on this assessment.'
-                - Format: '- [Severity: High/Medium/Low] For [Policy Aspect with Issue], recommend updating the policy to [specific change] to align with [Cited Regulation].'
-
+                **4. Referenced Regulations:**
+                [List all unique regulations cited in the Detailed Assessment section. If none were cited (e.g., all 'Unable to Assess' due to no context), state: 'No specific regulations were found highly relevant to this section based on the current threshold.']
+                - [Reference ID / Title of Regulation 1]
+                - [Reference ID / Title of Regulation 2]
+                ...
 
                 **Context (RBI Regulations):**
                 ```
@@ -333,8 +326,14 @@ class QueryPipeline:
                     for i, chunk_text in enumerate(chunks_from_section):
                         chunk_metadata = base_chunk_metadata.copy()
                         chunk_metadata["chunk_index_in_section"] = i
-                        # Clean the text for the final chunk
-                        cleaned_chunk_text = self.doc_processor.pdf_processor._clean_text(chunk_text) # Reuse cleaning
+
+                        # Clean the text for the final chunk - ONLY for non-PDF types
+                        cleaned_chunk_text = chunk_text # Default: no cleaning
+                        if file_ext == ".pdf":
+                            cleaned_chunk_text = chunk_text # PDFs are already cleaned
+                        else:
+                            cleaned_chunk_text = self.doc_processor.pdf_processor._clean_text(chunk_text) # Reuse cleaning
+
                         chunk_metadata["text"] = cleaned_chunk_text # Also store cleaned text in metadata like PDFProcessor does
 
                         # Generate a unique ID
