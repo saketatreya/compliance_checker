@@ -34,11 +34,14 @@ class IngestionPipeline:
         start_year: int = 2015,
         end_year: Optional[int] = None,
         doc_types: List[str] = ["circulars", "notifications"],
-        qdrant_host: str = "localhost",
-        qdrant_port: int = 6333,
+        qdrant_url_param: Optional[str] = None,      # Renamed to avoid clash with argparse
+        qdrant_api_key_param: Optional[str] = None, # Renamed to avoid clash with argparse
+        qdrant_host_arg: str = "localhost",       # From argparse, for fallback
+        qdrant_port_arg: int = 6333,            # From argparse, for fallback
         qdrant_collection: str = "rbi_regulations",
         vector_size: int = 768,
-        batch_size: int = 32
+        embedding_batch_size: int = 32, # Renamed from batch_size for clarity
+        qdrant_batch_size: int = 100    # Added for Qdrant upsert batching
     ):
         """Initialize the ingestion pipeline.
         
@@ -48,11 +51,14 @@ class IngestionPipeline:
             start_year: First year to scrape documents from
             end_year: Last year to scrape documents from (defaults to current year)
             doc_types: Types of documents to process
-            qdrant_host: Qdrant host address
-            qdrant_port: Qdrant port
+            qdrant_url_param: Qdrant Cloud URL (direct parameter)
+            qdrant_api_key_param: Qdrant API Key (direct parameter)
+            qdrant_host_arg: Qdrant host address (from argparse, for fallback)
+            qdrant_port_arg: Qdrant port (from argparse, for fallback)
             qdrant_collection: Qdrant collection name
             vector_size: Vector size for Qdrant
-            batch_size: Batch size for embedding processing
+            embedding_batch_size: Batch size for embedding processing
+            qdrant_batch_size: Batch size for Qdrant client upserts
         """
         self.data_dir = Path(data_dir)
         self.embedding_model = embedding_model
@@ -60,6 +66,25 @@ class IngestionPipeline:
         self.end_year = end_year
         self.doc_types = doc_types
         
+        # Determine Qdrant connection details (Priority: params -> env vars -> argparse defaults)
+        qdrant_url = qdrant_url_param or os.environ.get("QDRANT_URL")
+        qdrant_api_key = qdrant_api_key_param or os.environ.get("QDRANT_API_KEY")
+
+        final_qdrant_url = None
+        final_qdrant_port = None # Port is usually part of the URL for cloud
+
+        if qdrant_url:
+            final_qdrant_url = qdrant_url
+            logger.info(f"IngestionPipeline: Attempting to use Qdrant URL (from param/env): {final_qdrant_url}")
+            if qdrant_api_key:
+                logger.info("IngestionPipeline: Qdrant API Key IS provided (from param/env).")
+            else:
+                logger.warning("IngestionPipeline: Qdrant URL is set, but API Key is NOT provided. This might fail for secured cloud instances.")
+        else:
+            final_qdrant_url = qdrant_host_arg
+            final_qdrant_port = qdrant_port_arg
+            logger.info(f"IngestionPipeline: Attempting to use Qdrant host/port from arguments/defaults: {final_qdrant_url}:{final_qdrant_port}")
+            
         # Create data directories
         os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(self.data_dir / "raw", exist_ok=True)
@@ -75,22 +100,39 @@ class IngestionPipeline:
         self.embedder = DocumentEmbedder(
             model_name=embedding_model,
             input_dir=str(self.data_dir / "processed"),
-            output_dir=str(self.data_dir / "embeddings")
+            output_dir=str(self.data_dir / "embeddings"),
+            batch_size=embedding_batch_size # Use renamed embedding_batch_size
         )
         self.retriever = QdrantRetriever(
-            url=qdrant_host,
-            port=qdrant_port,
+            url=final_qdrant_url,
+            port=final_qdrant_port if not qdrant_url else None, # Port only if not using cloud URL
+            api_key=qdrant_api_key if qdrant_url else None,      # API key only if using cloud URL
             collection_name=qdrant_collection,
             embedding_dim=vector_size,
-            input_dir=str(self.data_dir / "embeddings")
+            input_dir=str(self.data_dir / "embeddings"),
+            qdrant_batch_size=qdrant_batch_size # Pass qdrant_batch_size
         )
         
-        # Initialize Qdrant client
-        self.qdrant_client = QdrantClient(host=qdrant_host, port=qdrant_port)
-        logger.info(f"Connected to Qdrant at {qdrant_host}:{qdrant_port}")
-        
+        # Initialize Qdrant client (or use the retriever's client)
+        # For simplicity, we'll re-initialize, but ideally, you'd use self.retriever.client
+        if qdrant_url: # Cloud or specific URL
+            ingest_qdrant_port = None
+            if "cloud.qdrant.io" in qdrant_url and qdrant_url.startswith("https://"):
+                ingest_qdrant_port = 6333 # Try Qdrant Cloud REST API over HTTPS on port 6333
+                logger.info(f"IngestionPipeline QdrantClient: Detected Qdrant Cloud URL (HTTPS). Setting port to {ingest_qdrant_port} for REST-like API.")
+            elif final_qdrant_port: # if a port was determined from args (e.g. for local non-default)
+                ingest_qdrant_port = final_qdrant_port
+
+            self.qdrant_client = QdrantClient(url=final_qdrant_url, port=ingest_qdrant_port, api_key=qdrant_api_key, prefer_grpc=False)
+            logger.info(f"IngestionPipeline QdrantClient: Successfully initialized for {final_qdrant_url}:{ingest_qdrant_port if ingest_qdrant_port else '(default)'} with prefer_grpc=False")
+        else: # Local default
+             self.qdrant_client = QdrantClient(host=final_qdrant_url, port=final_qdrant_port)
+             logger.info(f"IngestionPipeline QdrantClient: Successfully initialized for LOCAL at {final_qdrant_url}:{final_qdrant_port}")
+
         self.vector_size = vector_size
-        self.batch_size = batch_size
+        # It seems 'batch_size' in __init__ was intended for embedding.
+        # If Qdrant client also uses a batch_size, it's managed internally or in QdrantRetriever.
+        # self.qdrant_batch_size = batch_size # If needed for Qdrant client directly
         
         logger.info(f"Initialized ingestion pipeline with model: {embedding_model}")
     
@@ -129,7 +171,8 @@ class IngestionPipeline:
         """Run the embedding step of the pipeline."""
         logger.info("Starting document embedding")
         
-        self.embedder.process_all_documents(self.doc_types, self.batch_size)
+        # process_all_documents in DocumentEmbedder now uses its own configured batch_size
+        self.embedder.process_all_documents(self.doc_types) 
         
         return True
     
@@ -226,16 +269,30 @@ def parse_args():
         "--qdrant-host",
         type=str,
         default="localhost",
-        help="Qdrant host address"
+        help="Qdrant host address (fallback if QDRANT_URL env var or --qdrant-url not set)"
     )
     
     parser.add_argument(
         "--qdrant-port",
         type=int,
         default=6333,
-        help="Qdrant port"
+        help="Qdrant port (fallback if QDRANT_URL env var or --qdrant-url not set)"
     )
     
+    parser.add_argument(
+        "--qdrant-url",
+        type=str,
+        default=os.environ.get("QDRANT_URL"),
+        help="Qdrant Cloud URL (overrides host/port, also checks QDRANT_URL env var)"
+    )
+
+    parser.add_argument(
+        "--qdrant-api-key",
+        type=str,
+        default=os.environ.get("QDRANT_API_KEY"),
+        help="Qdrant API Key (used with --qdrant-url, also checks QDRANT_API_KEY env var)"
+    )
+
     parser.add_argument(
         "--qdrant-collection",
         type=str,
@@ -251,10 +308,17 @@ def parse_args():
     )
     
     parser.add_argument(
-        "--batch-size",
+        "--embedding-batch-size", # Renamed argument
         type=int,
         default=32,
         help="Batch size for embedding processing"
+    )
+    
+    parser.add_argument(
+        "--qdrant-batch-size",
+        type=int,
+        default=100,
+        help="Batch size for Qdrant upsert operations"
     )
     
     return parser.parse_args()
@@ -271,11 +335,14 @@ if __name__ == "__main__":
         start_year=args.start_year,
         end_year=args.end_year,
         doc_types=args.doc_types,
-        qdrant_host=args.qdrant_host,
-        qdrant_port=args.qdrant_port,
+        qdrant_url_param=args.qdrant_url,
+        qdrant_api_key_param=args.qdrant_api_key,
+        qdrant_host_arg=args.qdrant_host,
+        qdrant_port_arg=args.qdrant_port,
         qdrant_collection=args.qdrant_collection,
         vector_size=args.vector_size,
-        batch_size=args.batch_size
+        embedding_batch_size=args.embedding_batch_size, # Use renamed arg
+        qdrant_batch_size=args.qdrant_batch_size      # Use new arg
     )
     
     # Run pipeline with specified steps

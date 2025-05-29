@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup, NavigableString
 from tqdm import tqdm
 import re
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+import multiprocessing # Import multiprocessing
 
 # Configure logging
 logging.basicConfig(
@@ -199,31 +200,52 @@ class PDFProcessor(BaseProcessor):
         logger.debug(f"Generated {len(final_chunks)} chunks from {pdf_path.name}")
         return final_chunks
         
+    def _process_single_pdf_wrapper(self, args: Tuple[str, Optional[str], str]) -> List[Dict]:
+        """Wrapper to process a single PDF, to be used with multiprocessing.Pool."""
+        pdf_path_str, metadata_path, doc_type = args
+        try:
+            processed_data = self.process_document(pdf_path_str, metadata_path)
+            if processed_data:
+                for chunk_dict in processed_data:
+                    # Ensure file_name is present if not already added by process_document
+                    if 'file_name' not in chunk_dict['metadata']:
+                         chunk_dict['metadata']['file_name'] = Path(pdf_path_str).name
+                    chunk_dict['metadata']['doc_type'] = doc_type
+                return processed_data
+        except Exception as e:
+            logger.error(f"Error processing PDF document {pdf_path_str} in worker: {e}", exc_info=True)
+        return []
+        
     def process_all_documents(self, doc_type: str = "circulars") -> List[Dict]:
-        """Process all PDF documents of a given type in the input directory."""
+        """Process all PDF documents of a given type in the input directory using multiprocessing."""
         doc_dir = self.input_dir / doc_type
         if not doc_dir.is_dir():
             logger.warning(f"PDF Directory not found for doc_type '{doc_type}': {doc_dir}")
             return []
         
-        all_chunks = []
         pdf_files = list(doc_dir.glob("*.pdf")) + list(doc_dir.glob("*.PDF"))
+        logger.info(f"Found {len(pdf_files)} PDF documents in {doc_dir} for parallel processing.")
         
-        logger.info(f"Found {len(pdf_files)} PDF documents in {doc_dir}")
+        if not pdf_files:
+            return []
+
+        all_chunks = []
+        # Prepare arguments for the pool
+        # Assuming no specific metadata files for now, so metadata_path is None
+        tasks = [(str(pdf_path), None, doc_type) for pdf_path in pdf_files]
+
+        # Determine number of processes (e.g., number of CPU cores)
+        num_processes = multiprocessing.cpu_count()
+        logger.info(f"Using {num_processes} processes for PDF processing.")
+
+        with multiprocessing.Pool(processes=num_processes) as pool:
+            results = list(tqdm(pool.imap(self._process_single_pdf_wrapper, tasks), total=len(tasks), desc=f"Processing PDF {doc_type}"))
         
-        for pdf_path in tqdm(pdf_files, desc=f"Processing PDF {doc_type}"):
-            metadata_path = None # Assuming no specific metadata files for now
-            try:
-                processed_data = self.process_document(str(pdf_path), metadata_path)
-                if processed_data:
-                     # Ensure metadata includes doc_type (filename added in process_document)
-                    for chunk_dict in processed_data:
-                        chunk_dict['metadata']['doc_type'] = doc_type
-                    all_chunks.extend(processed_data)
-            except Exception as e:
-                logger.error(f"Error processing PDF document {pdf_path}: {e}", exc_info=True)
+        for result_list in results:
+            if result_list: # Filter out empty lists from failed processing
+                all_chunks.extend(result_list)
                 
-        logger.info(f"Completed processing PDFs for {doc_type}. Total chunks: {len(all_chunks)}")
+        logger.info(f"Completed parallel processing PDFs for {doc_type}. Total chunks: {len(all_chunks)}")
         return all_chunks
 
 class HTMLProcessor(BaseProcessor):
@@ -243,6 +265,22 @@ class HTMLProcessor(BaseProcessor):
             return content_div 
         logger.warning("Could not identify main content area.")
         return soup.body # Fallback to body
+
+    def _process_single_html_wrapper(self, args: Tuple[str, Optional[str], str]) -> List[Dict]:
+        """Wrapper to process a single HTML, to be used with multiprocessing.Pool."""
+        html_path_str, metadata_path, doc_type = args
+        try:
+            processed_data = self.process_document(html_path_str, metadata_path)
+            if processed_data:
+                for chunk_dict in processed_data:
+                     # Ensure file_name is present if not already added by process_document
+                    if 'file_name' not in chunk_dict['metadata']:
+                         chunk_dict['metadata']['file_name'] = Path(html_path_str).name
+                    chunk_dict['metadata']['doc_type'] = doc_type
+                return processed_data
+        except Exception as e:
+            logger.error(f"Error processing HTML document {html_path_str} in worker: {e}", exc_info=True)
+        return []
 
     def process_document(self, html_path: str, metadata_path: Optional[str] = None) -> List[Dict]:
         logger.info(f"Processing HTML document into sections: {html_path}")
@@ -301,31 +339,33 @@ class HTMLProcessor(BaseProcessor):
             return []
 
     def process_all_documents(self, doc_type: str = "circulars") -> List[Dict]:
-        """Process all HTML documents of a given type in the input directory."""
+        """Process all HTML documents of a given type in the input directory using multiprocessing."""
         doc_dir = self.input_dir / doc_type
         if not doc_dir.is_dir():
             logger.warning(f"HTML Directory not found for doc_type '{doc_type}': {doc_dir}")
             return []
         
-        all_chunks = []
         html_files = list(doc_dir.glob("*.html")) + list(doc_dir.glob("*.htm")) + list(doc_dir.glob("*.HTML")) + list(doc_dir.glob("*.HTM"))
-        
-        logger.info(f"Found {len(html_files)} HTML documents in {doc_dir}")
-        
-        for html_path in tqdm(html_files, desc=f"Processing HTML {doc_type}"):
-            metadata_path = None # Assuming no specific metadata files for now
-            try:
-                processed_data = self.process_document(str(html_path), metadata_path)
-                if processed_data:
-                    # Ensure metadata includes doc_type and filename
-                    for chunk_dict in processed_data:
-                        chunk_dict['metadata']['doc_type'] = doc_type
-                        chunk_dict['metadata']['file_name'] = html_path.name # Add filename here
-                    all_chunks.extend(processed_data)
-            except Exception as e:
-                logger.error(f"Error processing HTML document {html_path}: {e}", exc_info=True)
+        logger.info(f"Found {len(html_files)} HTML documents in {doc_dir} for parallel processing.")
+
+        if not html_files:
+            return []
+
+        all_chunks = []
+        # Prepare arguments for the pool
+        tasks = [(str(html_file), None, doc_type) for html_file in html_files]
+
+        num_processes = multiprocessing.cpu_count()
+        logger.info(f"Using {num_processes} processes for HTML processing.")
+
+        with multiprocessing.Pool(processes=num_processes) as pool:
+            results = list(tqdm(pool.imap(self._process_single_html_wrapper, tasks), total=len(tasks), desc=f"Processing HTML {doc_type}"))
+
+        for result_list in results:
+            if result_list:
+                all_chunks.extend(result_list)
                 
-        logger.info(f"Completed processing HTML for {doc_type}. Total chunks: {len(all_chunks)}")
+        logger.info(f"Completed parallel processing HTML for {doc_type}. Total chunks: {len(all_chunks)}")
         return all_chunks
 
 class TextProcessor:

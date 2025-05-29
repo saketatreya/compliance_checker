@@ -194,10 +194,82 @@ def create_compliance_donut_chart(status_counts: Counter):
 def get_pipeline():
     """Initializes and returns the QueryPipeline instance."""
     logger.info("Initializing QueryPipeline...")
+    qdrant_url = None
+    qdrant_api_key = None
+    google_api_key_secret = None
+
     try:
-        # Load keys just before initializing pipeline
-        load_environment_variables()
-        pipeline = QueryPipeline() # Uses defaults including the LLM model
+        # Attempt to load from Streamlit secrets first
+        logger.info(f"Checking for Streamlit secrets. hasattr(st, 'secrets'): {hasattr(st, 'secrets')}")
+        if hasattr(st, 'secrets'):
+            logger.info(f"st.secrets object type: {type(st.secrets)}")
+            logger.info(f"Number of secrets found: {len(st.secrets) if st.secrets is not None else 'st.secrets is None'}")
+            logger.info(f"Secret keys available: {list(st.secrets.keys()) if st.secrets is not None and hasattr(st.secrets, 'keys') else 'Cannot list keys'}")
+
+        if hasattr(st, 'secrets') and len(st.secrets) > 0: # Check if secrets are available and populated
+            logger.info("Attempting to load credentials from Streamlit secrets.")
+            qdrant_url = st.secrets.get("QDRANT_URL")
+            qdrant_api_key = st.secrets.get("QDRANT_API_KEY")
+            google_api_key_secret = st.secrets.get("GOOGLE_API_KEY")
+            logger.info(f"Loaded from st.secrets - QDRANT_URL: {'Found' if qdrant_url else 'Not Found'}, QDRANT_API_KEY: {'Found' if qdrant_api_key else 'Not Found'}, GOOGLE_API_KEY: {'Found' if google_api_key_secret else 'Not Found'}")
+        else:
+            logger.info("Streamlit secrets not found or empty, will proceed to check environment variables.")
+    except Exception as e: # Catch any error during secrets access, including StreamlitSecretNotFoundError
+        logger.warning(f"Could not load from Streamlit secrets (error: {e}), will proceed to check environment variables.")
+        # Ensure variables are None if secrets access failed, so fallback logic triggers correctly
+        qdrant_url = None
+        qdrant_api_key = None
+        google_api_key_secret = None
+
+    # Fallback to environment variables if not found in secrets
+    if not all([qdrant_url, qdrant_api_key, google_api_key_secret]):
+        logger.info("One or more credentials not found via Streamlit secrets, attempting to load from .env or direct environment variables.")
+        load_environment_variables() # Loads .env if it exists
+
+        if not qdrant_url:
+            qdrant_url = os.environ.get("QDRANT_URL")
+            logger.info(f"QDRANT_URL from env: {'Found' if qdrant_url else 'Not Found'}")
+        if not qdrant_api_key:
+            qdrant_api_key = os.environ.get("QDRANT_API_KEY")
+            logger.info(f"QDRANT_API_KEY from env: {'Found' if qdrant_api_key else 'Not Found'}")
+        if not google_api_key_secret:
+            google_api_key_secret = os.environ.get("GOOGLE_API_KEY")
+            logger.info(f"GOOGLE_API_KEY from env: {'Found' if google_api_key_secret else 'Not Found'}")
+
+    if not google_api_key_secret:
+        st.warning("GOOGLE_API_KEY not found in Streamlit secrets or environment variables. LLM features may be limited or non-functional.")
+        # Potentially fall back to a non-LLM mode or show a persistent error
+    
+    # Critical check for deployed environment (this part might need adjustment based on how IS_DEPLOYED is set)
+    # For now, assuming it's for Streamlit Cloud deployment.
+    # If running locally, we rely on the QDRANT_URL and QDRANT_API_KEY from env vars we are passing.
+    is_deployed_env = os.environ.get("IS_DEPLOYED", "FALSE").upper() == "TRUE" # Example way to check if deployed
+    if is_deployed_env: # Check if running in deployed environment
+        logger.info("Detected deployed environment context.")
+        if not qdrant_url:
+            st.error("QDRANT_URL is not set in Streamlit secrets for deployed environment. App cannot connect to vector database.")
+            return None
+        if not qdrant_api_key:
+            st.error("QDRANT_API_KEY is not set in Streamlit secrets for deployed environment. App cannot authenticate.")
+            return None
+    else:
+        logger.info("Detected local development context (or IS_DEPLOYED is not TRUE).")
+        # For local, ensure critical Qdrant vars are present (they should be, from our command line)
+        if not qdrant_url:
+            st.error("QDRANT_URL is not set in environment variables for local run. App cannot connect to vector database.")
+            return None
+        # API key might be optional for a local, unsecured Qdrant instance, but required for cloud.
+        # The QdrantRetriever will handle this if api_key is None for a cloud URL.
+        if "cloud.qdrant.io" in (qdrant_url or "") and not qdrant_api_key:
+             st.warning("Connecting to Qdrant Cloud URL but QDRANT_API_KEY is not set. This will likely fail.")
+
+
+    try:
+        pipeline = QueryPipeline(
+            qdrant_url=qdrant_url, 
+            qdrant_api_key=qdrant_api_key, 
+            google_api_key=google_api_key_secret
+        )
         logger.info("QueryPipeline initialized successfully.")
         return pipeline
     except Exception as e:

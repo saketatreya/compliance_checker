@@ -28,7 +28,8 @@ class DocumentEmbedder:
         self, 
         model_name: str = "all-mpnet-base-v2", 
         input_dir: str = "data/processed", 
-        output_dir: str = "data/embeddings"
+        output_dir: str = "data/embeddings",
+        batch_size: int = 32
     ):
         """Initialize the document embedder.
         
@@ -36,10 +37,12 @@ class DocumentEmbedder:
             model_name: Name of the sentence transformer model to use
             input_dir: Directory containing processed text chunks
             output_dir: Directory to store embeddings
+            batch_size: Default batch size for embedding generation
         """
         self.model_name = model_name
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
+        self.batch_size = batch_size
         
         # Create output directory if it doesn't exist
         os.makedirs(self.output_dir, exist_ok=True)
@@ -60,24 +63,25 @@ class DocumentEmbedder:
         """
         return self.model.encode(text, show_progress_bar=False)
     
-    def embed_batch(self, texts: List[str], batch_size: int = 32) -> np.ndarray:
+    def embed_batch(self, texts: List[str], batch_size: Optional[int] = None) -> np.ndarray:
         """Generate embeddings for a batch of texts.
         
         Args:
             texts: List of texts to embed
-            batch_size: Batch size for embedding generation
+            batch_size: Batch size for embedding generation (defaults to constructor's batch_size)
             
         Returns:
             Numpy array containing the embedding vectors
         """
-        return self.model.encode(texts, batch_size=batch_size, show_progress_bar=True)
+        current_batch_size = batch_size if batch_size is not None else self.batch_size
+        return self.model.encode(texts, batch_size=current_batch_size, show_progress_bar=True)
     
-    def process_chunks_file(self, file_path: str, batch_size: int = 32) -> List[Dict]:
+    def process_chunks_file(self, file_path: str, batch_size: Optional[int] = None) -> List[Dict]:
         """Process a file containing text chunks and generate embeddings.
         
         Args:
             file_path: Path to JSONL file containing text chunks
-            batch_size: Batch size for embedding generation
+            batch_size: Batch size for embedding generation (defaults to constructor's batch_size)
             
         Returns:
             List of dictionaries containing chunks with embeddings
@@ -96,7 +100,8 @@ class DocumentEmbedder:
         logger.info(f"Loaded {len(chunks)} chunks for embedding")
         
         # Generate embeddings in batches
-        embeddings = self.embed_batch(texts, batch_size=batch_size)
+        current_batch_size = batch_size if batch_size is not None else self.batch_size
+        embeddings = self.embed_batch(texts, batch_size=current_batch_size)
         
         # Add embeddings to chunks
         for i, chunk in enumerate(chunks):
@@ -117,14 +122,14 @@ class DocumentEmbedder:
             for chunk in chunks:
                 f.write(json.dumps(chunk) + "\n")
     
-    def process_all_documents(self, doc_types: List[str] = ["circulars", "notifications"], batch_size: int = 32):
+    def process_all_documents(self, doc_types: List[str] = ["circulars", "notifications"]):
         """Process all document types and generate embeddings.
         
         Args:
             doc_types: List of document types to process
-            batch_size: Batch size for embedding generation
         """
-        for doc_type in doc_types:
+        logger.info(f"Starting embedding process for {len(doc_types)} document type(s).")
+        for doc_type in tqdm(doc_types, desc="Embedding Document Types"):
             input_file = self.input_dir / f"{doc_type}_processed.jsonl"
             output_file = self.output_dir / f"{doc_type}_embedded.jsonl"
             
@@ -132,8 +137,8 @@ class DocumentEmbedder:
                 logger.warning(f"Input file not found: {input_file}")
                 continue
             
-            # Process chunks and generate embeddings
-            chunks = self.process_chunks_file(str(input_file), batch_size=batch_size)
+            # Process chunks and generate embeddings using the instance's batch_size
+            chunks = self.process_chunks_file(str(input_file))
             
             # Save embeddings
             self.save_embeddings(chunks, str(output_file))
