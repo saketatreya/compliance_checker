@@ -4,6 +4,7 @@ os.environ['STREAMLIT_SERVER_FILE_WATCHER_TYPE'] = 'none'
 import streamlit as st
 import torch # Ensure torch is imported
 import os # for the more robust workaround
+import time
 
 from pathlib import Path
 import tempfile
@@ -305,6 +306,18 @@ if 'filter_status' not in st.session_state:
     st.session_state.filter_status = "All"
 if 'search_term' not in st.session_state:
     st.session_state.search_term = ""
+# --- New Session State variables for incremental analysis ---
+if 'analysis_state' not in st.session_state:
+    # States: 'initial', 'preprocessing', 'analyzing', 'complete', 'error'
+    st.session_state.analysis_state = 'initial' 
+if 'document_chunks' not in st.session_state:
+    st.session_state.document_chunks = []
+if 'processed_sections' not in st.session_state:
+    st.session_state.processed_sections = []
+if 'current_chunk_index' not in st.session_state:
+    st.session_state.current_chunk_index = 0
+if 'temp_file_path' not in st.session_state:
+    st.session_state.temp_file_path = None
 
 # --- Sidebar for Configuration ---
 st.sidebar.header("Analysis Configuration")
@@ -316,11 +329,9 @@ st.sidebar.caption("Adjust how strictly the analysis matches regulations.")
 # Add Reset Button to Sidebar
 st.sidebar.divider()
 if st.sidebar.button("Clear Results / Start New", key="clear_button", use_container_width=True):
-    st.session_state.analysis_results = None
-    st.session_state.uploaded_file_name = None
-    st.session_state.last_analysis_params = {}
-    st.session_state.filter_status = "All"
-    st.session_state.search_term = ""
+    # Reset all state variables, including new ones
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
     st.rerun()
 
 # --- Initialize Pipeline ---
@@ -348,93 +359,131 @@ with col1:
     analyze_button = st.button("Analyze Compliance", key="analyze_button", disabled=analyze_button_disabled, use_container_width=True)
 
     if uploaded_file is not None:
-        st.info(f"Uploaded: **{uploaded_file.name}**")
-
-        # Store filename if it changes
         if st.session_state.uploaded_file_name != uploaded_file.name:
-             st.session_state.uploaded_file_name = uploaded_file.name
-             st.session_state.analysis_results = None # Clear old results on new file
-             st.session_state.last_analysis_params = {}
-             st.session_state.filter_status = "All" # Reset filters on new file
-             st.session_state.search_term = ""
+            st.info(f"New file uploaded: **{uploaded_file.name}**. Click 'Analyze Compliance' to begin.")
+            # Reset state for the new file
+            st.session_state.analysis_state = 'initial'
+            st.session_state.analysis_results = None
+            st.session_state.uploaded_file_name = uploaded_file.name
+            st.session_state.processed_sections = []
+            st.session_state.document_chunks = []
+            st.session_state.current_chunk_index = 0
+        else:
+            st.info(f"Current file: **{st.session_state.uploaded_file_name}**")
 
 with col2:
     st.subheader("Analysis Report")
-
+    
     # Placeholder for the progress bar
     progress_bar_placeholder = st.empty()
     progress_text_placeholder = st.empty()
 
-    # --- Run Analysis ---
+    # --- State-driven Analysis Flow ---
+    
+    # 1. Initialization Step (triggered by button)
     if analyze_button and uploaded_file is not None:
-        # Check if analysis needs to be rerun (new file or changed params)
-        current_params = {"top_k": top_k, "threshold": score_threshold}
-        if st.session_state.analysis_results is None or st.session_state.last_analysis_params != current_params:
-            # Save uploaded file temporarily
-            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_file.name).suffix) as tmp_file:
-                tmp_file.write(uploaded_file.getvalue())
-                tmp_file_path = tmp_file.name
-                logger.info(f"Saved uploaded file to temporary path: {tmp_file_path}")
+        st.session_state.analysis_state = 'preprocessing'
+        st.session_state.processed_sections = []
+        st.session_state.current_chunk_index = 0
+        
+        # Save uploaded file to a temporary path that persists across reruns
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_file.name).suffix) as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            st.session_state.temp_file_path = tmp_file.name
+        
+        st.rerun()
 
-            # Replace spinner with progress bar
-            progress_bar = progress_bar_placeholder.progress(0)
-            progress_text = progress_text_placeholder.text("Starting analysis... 0%")
-
-            # Define the callback function for progress updates
-            def update_progress(value):
-                # Ensure value is between 0 and 1
-                value = max(0.0, min(1.0, value))
-                percent_complete = int(value * 100)
-                progress_bar.progress(value)
-                # More specific progress text
-                if value < 0.1:
-                    progress_text.text(f"Preprocessing document... {percent_complete}%")
-                elif value < 0.8:
-                    progress_text.text(f"Analyzing sections... {percent_complete}%")
-                else:
-                    progress_text.text(f"Generating report... {percent_complete}%")
-
-            try:
-                # Run the analysis with selected parameters and the callback
-                logger.info(f"Running analysis with top_k={top_k}, score_threshold={score_threshold}")
-                analysis_results = pipeline.analyze_document(
-                    tmp_file_path,
-                    top_k=top_k,
-                    score_threshold=score_threshold,
-                    progress_callback=update_progress # Pass the callback here
-                )
-                st.session_state.analysis_results = analysis_results # Store results
-                st.session_state.last_analysis_params = current_params # Store params used
-                logger.info("Analysis complete.")
-                # Clear progress bar after completion
-                progress_bar_placeholder.empty()
-                progress_text_placeholder.empty()
-
-            except Exception as e:
-                st.error(f"An unexpected error occurred during analysis: {e}")
-                logger.error(f"Analysis button error: {e}", exc_info=True)
-                st.session_state.analysis_results = {"error": str(e)} # Store error
-                # Clear progress bar even on error
-                progress_bar_placeholder.empty()
-                progress_text_placeholder.empty()
-            finally:
-                # Clean up the temporary file
-                if 'tmp_file_path' in locals() and os.path.exists(tmp_file_path):
-                    try:
-                        os.remove(tmp_file_path)
-                        logger.info(f"Removed temporary file: {tmp_file_path}")
-                    except Exception as e_clean:
-                        logger.warning(f"Could not remove temporary file {tmp_file_path}: {e_clean}")
-
-            # Rerun script to display results after analysis finishes
+    # 2. Pre-processing Step
+    if st.session_state.analysis_state == 'preprocessing':
+        progress_text_placeholder.text("Step 1/3: Preprocessing document...")
+        progress_bar_placeholder.progress(0.1)
+        try:
+            logger.info(f"Preprocessing document: {st.session_state.temp_file_path}")
+            chunks = pipeline.preprocess_document_for_analysis(st.session_state.temp_file_path)
+            st.session_state.document_chunks = chunks
+            st.session_state.analysis_state = 'analyzing'
+            logger.info(f"Document preprocessed into {len(chunks)} chunks.")
+            st.rerun()
+        except Exception as e:
+            st.session_state.analysis_state = 'error'
+            st.session_state.error_message = f"Failed during preprocessing: {e}"
+            logger.error(f"Preprocessing error: {e}", exc_info=True)
             st.rerun()
 
-    # --- Display Results ---
-    if st.session_state.analysis_results is not None:
-        results = st.session_state.analysis_results
-        processed_sections = [] # Store processed data for filtering
+    # 3. Incremental Analysis Step
+    if st.session_state.analysis_state == 'analyzing':
+        total_chunks = len(st.session_state.document_chunks)
+        current_index = st.session_state.current_chunk_index
 
-        # Check for errors stored in session state
+        if current_index < total_chunks:
+            # Update progress UI
+            progress = (current_index + 1) / total_chunks
+            progress_text_placeholder.text(f"Step 2/3: Analyzing section {current_index + 1} of {total_chunks}...")
+            progress_bar_placeholder.progress(progress)
+
+            try:
+                # Analyze one chunk
+                chunk = st.session_state.document_chunks[current_index]
+                analysis_text = pipeline.analyze_single_chunk(
+                    chunk,
+                    top_k=top_k,
+                    score_threshold=score_threshold
+                )
+                
+                # Parse and store the result
+                parsed_analysis = parse_llm_analysis(analysis_text, current_index)
+                st.session_state.processed_sections.append(parsed_analysis)
+                
+                # Move to the next chunk
+                st.session_state.current_chunk_index += 1
+                
+                # Short delay to allow UI to update, then rerun for the next chunk
+                time.sleep(0.1) 
+                st.rerun()
+
+            except Exception as e:
+                st.session_state.analysis_state = 'error'
+                st.session_state.error_message = f"Failed analyzing section {current_index + 1}: {e}"
+                logger.error(f"Analysis error on chunk {current_index}: {e}", exc_info=True)
+                st.rerun()
+        else:
+            # All chunks are processed
+            st.session_state.analysis_state = 'complete'
+            st.rerun()
+
+    # 4. Finalization and Display Step
+    if st.session_state.analysis_state == 'complete':
+        progress_text_placeholder.text("Step 3/3: Generating final report...")
+        progress_bar_placeholder.progress(1.0)
+        
+        # Consolidate results into the format the rest of the UI expects
+        final_results = {
+            "parameters": {"top_k": top_k, "score_threshold": score_threshold},
+            "section_analyses": st.session_state.processed_sections # Here we use the incrementally built list
+        }
+        st.session_state.analysis_results = final_results
+        
+        # Clean up temporary file
+        if st.session_state.temp_file_path and os.path.exists(st.session_state.temp_file_path):
+            os.remove(st.session_state.temp_file_path)
+            st.session_state.temp_file_path = None
+        
+        # Clear progress indicators
+        time.sleep(1) # Give user a moment to see "complete"
+        progress_bar_placeholder.empty()
+        progress_text_placeholder.empty()
+
+    # --- Display Results or Errors ---
+    if st.session_state.analysis_state == 'error':
+        st.error(st.session_state.get("error_message", "An unknown error occurred."))
+        progress_bar_placeholder.empty()
+        progress_text_placeholder.empty()
+        
+    if st.session_state.analysis_results and st.session_state.analysis_state in ['complete', 'initial']:
+        results = st.session_state.analysis_results
+        processed_sections = [] # This will be rebuilt from the final results for display logic
+
+        # Check for errors stored in session state (legacy)
         if isinstance(results, dict) and "error" in results:
             st.error(f"Analysis failed: {results['error']}")
         elif not results or not results.get("section_analyses"):
@@ -447,26 +496,27 @@ with col2:
             st.caption(f"Document: `{doc_name}` | Top K Regulations: {params.get('top_k', 'N/A')} | Similarity Threshold: {params.get('score_threshold', 'N/A')}")
 
             # --- Process Sections --- 
+            # This part now processes the final, consolidated results
             section_analyses = results.get("section_analyses", [])
             total_sections = len(section_analyses)
 
             for i, section_data in enumerate(section_analyses):
-                analysis_text = section_data.get("analysis_text", "Analysis not available.")
-                parsed_analysis = parse_llm_analysis(analysis_text, i)
-
+                # The data is already parsed, so we just reconstruct the 'processed_sections' list for the UI
                 processed_sections.append({
                     "original_index": i,
-                    "section_title": parsed_analysis["llm_section_title"],
-                    "compliance_status": parsed_analysis["compliance_status"],
-                    "compliance_pct": parsed_analysis["compliance_pct"],
-                    "compliance_verdict": parsed_analysis["compliance_verdict"],
-                    "analysis_text": parsed_analysis["raw_analysis"], # Store raw for display
-                    "section_text": section_data.get("section_text", ""), # Use correct key 'section_text'
-                    "referenced_regulations": parsed_analysis["referenced_regulations"], # Correct source and add key
-                    "detailed_assessment": parsed_analysis["detailed_assessment"], # Add missing key
-                    "action_items": parsed_analysis["action_items"],
-                    "metrics": parsed_analysis["metrics"],
-                    "severity_counts": parsed_analysis["severity_counts"]
+                    "section_title": section_data.get("llm_section_title", f"Section {i+1}"),
+                    "compliance_status": section_data.get("compliance_status", "Unable to Assess"),
+                    "compliance_pct": section_data.get("compliance_pct", 0),
+                    "compliance_verdict": section_data.get("compliance_verdict", "Unable to Assess"),
+                    "analysis_text": section_data.get("raw_analysis", "Analysis not available."),
+                    # We need to get the original section text. This requires modifying the stored data.
+                    # For now, this might be missing.
+                    "section_text": st.session_state.document_chunks[i] if i < len(st.session_state.document_chunks) else "",
+                    "referenced_regulations": section_data.get("referenced_regulations", ""),
+                    "detailed_assessment": section_data.get("detailed_assessment", ""),
+                    "action_items": section_data.get("action_items", []),
+                    "metrics": section_data.get("metrics", {}),
+                    "severity_counts": section_data.get("severity_counts", {})
                 })
 
             # --- Calculate Overall Summary --- 
@@ -623,9 +673,9 @@ with col2:
                         # with st.popover("Show Raw LLM Output"):
                         #    st.text_area("Raw LLM Analysis", section['raw_analysis'], height=200, disabled=True)
 
-    elif st.session_state.uploaded_file_name:
+    elif st.session_state.analysis_state == 'initial' and st.session_state.uploaded_file_name:
         # If a file was uploaded but no results yet (e.g., after clearing)
         st.info(f"Ready to analyze **{st.session_state.uploaded_file_name}**. Click 'Analyze Compliance' on the left.")
-    else:
+    elif st.session_state.analysis_state == 'initial':
         # Initial state before any upload
         st.info("Upload a document using the panel on the left to begin the compliance analysis.")
