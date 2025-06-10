@@ -1,4 +1,10 @@
+import os
+os.environ['STREAMLIT_SERVER_FILE_WATCHER_TYPE'] = 'none'
+
 import streamlit as st
+import torch # Ensure torch is imported
+import os # for the more robust workaround
+
 from pathlib import Path
 import tempfile
 import logging
